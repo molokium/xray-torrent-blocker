@@ -1,0 +1,53 @@
+[Unit]
+Description=PasarGuard Torrent Blocker
+Documentation=https://github.com/kutovoys/xray-torrent-blocker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated, unprivileged system account. It needs no login shell and no
+# capabilities: the service only reads a log and writes its journal.
+User=tblocker
+Group=tblocker
+ExecStart=/opt/tblocker/tblocker -c /opt/tblocker/config.yaml
+Restart=on-failure
+RestartSec=5s
+
+# Sandboxing. This service never touches the firewall or network configuration.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
+UMask=0077
+LimitCORE=0
+KeyringMode=private
+RemoveIPC=true
+
+# Only the journal directory is writable. The binary and config are read-only,
+# so a compromised process cannot persist by overwriting them.
+ReadOnlyPaths=/opt/tblocker/tblocker /opt/tblocker/config.yaml
+ReadWritePaths=/opt/tblocker
+
+[Install]
+WantedBy=multi-user.target

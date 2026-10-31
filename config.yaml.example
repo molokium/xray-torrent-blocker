@@ -1,0 +1,133 @@
+# PasarGuard torrent-blocker configuration
+#
+# This build never touches the host firewall. A detection disables the
+# PasarGuard account through the panel API for BlockDuration minutes and then
+# enables it again.
+
+# Required. Xray access log written by the node that carries user traffic.
+# The service runs as the unprivileged tblocker user; make the log readable by
+# that user (ACL) or the service will log a permission error and never detect.
+LogFile: "/var/lib/pg-node/access.log"
+
+# Required. Block duration in minutes. Must be greater than 0.
+BlockDuration: 10
+
+# Tag that identifies torrent lines in the access log. Keep it in sync with the
+# routing rule's outboundTag in the Xray configuration.
+TorrentTag: "TORRENT"
+
+# Directory for blocks.json, the durable block journal. Keep it on persistent
+# storage: it is what lets the service re-enable users after a restart. It must
+# be writable by the tblocker service user (0750, owned tblocker:tblocker).
+StorageDir: "/opt/tblocker"
+
+# Optional. Name shown in admin notifications. Defaults to the system hostname.
+# Hostname: "node-1"
+
+# How often the expiry worker runs, in seconds. Default: 15. Range: 5-3600.
+# CheckIntervalSeconds: 15
+
+# Use stat polling instead of inotify for the access log. Inotify is the
+# default and is cheaper; enable polling only when the log lives on a
+# filesystem where inotify events are unreliable (some bind mounts/NFS).
+UsePolling: false
+
+# ---------------------------------------------------------------------------
+# PasarGuard panel API (required)
+# ---------------------------------------------------------------------------
+PasarGuard:
+  # Panel root URL, without /api. A path prefix is supported.
+  BaseURL: "https://panel.example.com"
+
+  # API key created in the panel (API Keys page). It needs:
+  #   users:read   - resolve a user and read its current status
+  #   users:update - disable and re-enable the account
+  # with scope "all" (or at least access to every user you want to police).
+  #
+  # A PasarGuard API key starts with pg_key_ and is sent as X-Api-Key.
+  # An admin JWT is also accepted and is sent as a Bearer token, but it expires.
+  APIKey: "pg_key_00000000-0000-4000-8000-000000000000"
+
+  # How to interpret the value captured from the log's email field.
+  #   auto     - numeric values are tried as a user ID, then as a username
+  #   id       - the captured value is always a numeric user ID
+  #   username - the captured value is always a username
+  #
+  # PasarGuard writes the numeric user ID into Xray's email field, so "auto"
+  # or "id" is normally correct.
+  Identifier: "auto"
+
+  # Per-request timeout in seconds. Default: 10. Range: 1-120.
+  TimeoutSeconds: 10
+
+  # Disable TLS verification. Only for a trusted private network.
+  InsecureSkipVerify: false
+
+  # Re-enable the account when the block expires. Default: true.
+  # Set to false to leave accounts disabled for an administrator to review.
+  ReenableOnUnblock: true
+
+  # Probe /api/admin and the user-read endpoint at startup and log a clear
+  # error when the URL, key, or permissions are wrong. Default: true.
+  StartupCheck: true
+
+# ---------------------------------------------------------------------------
+# Log parsing
+# ---------------------------------------------------------------------------
+# Capture group 1 must be the PasarGuard identity from the access log.
+# The default matches the email field emitted by PasarGuard:
+#   ... [inbound >> TORRENT] email: 42
+# The leading whitespace and the required whitespace after the colon prevent a
+# destination such as "tcp:email:5" from being mistaken for the user field.
+# If you customize this, keep the same anchoring: do not match a bare "email:"
+# anywhere in the line, or a destination can spoof the identity.
+# If your node logs a different format, adjust this expression.
+UsernameRegex: '\semail:\s+(\S+)'
+
+# Optional. Telegram chat ID embedded in the identity/email value, the panel
+# username, or the user note. It is tried in that order. Capture group 1 must be
+# the numeric chat ID. The raw log line is deliberately not used: a destination
+# hostname could otherwise contain a "tgid-" value.
+# Example usernames: alice_tgid-123456789
+# TidRegex: 'tgid-(-?\d+)'
+
+# ---------------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------------
+# Send a message to the administrator on block/unblock.
+SendAdminMessage: true
+AdminBotToken: "123456:ADMIN_BOT_TOKEN"
+AdminChatID: "123456789"
+
+# Optional overrides for the admin messages. Four %s arguments are supplied:
+# username, IP, server hostname, username (again, for the hashtag).
+# AdminBlockTemplate: ""
+# AdminUnblockTemplate: ""
+
+# Send a message to the user. Requires TidRegex and a chat ID on the account.
+SendUserMessage: false
+BotToken: "123456:USER_BOT_TOKEN"
+
+# Message sent to the user. Two %d arguments are supplied: block duration twice.
+# A template without format verbs is sent as-is.
+# UserMessageTemplate: ""
+
+# Telegram Bot API base URL. Change it when using a local Bot API server.
+TelegramAPIURL: "https://api.telegram.org"
+
+# ---------------------------------------------------------------------------
+# Webhook notifications (optional)
+# ---------------------------------------------------------------------------
+SendWebhook: false
+WebhookURL: "https://example.com/tblocker"
+# Five %s arguments: username, IP, server, action (block/unblock), RFC3339 time.
+# A sixth %d argument (block duration in minutes) is also supported.
+WebhookTemplate: '{"username":"%s","ip":"%s","server":"%s","action":"%s","timestamp":"%s"}'
+WebhookHeaders:
+  Authorization: "Bearer change-me"
+
+# ---------------------------------------------------------------------------
+# Removed options
+# ---------------------------------------------------------------------------
+# BlockMode and BypassIPS were part of the firewall-based versions. They are
+# ignored with a startup warning and no firewall command is ever executed.
