@@ -32,6 +32,20 @@ type Notifier interface {
 	Unblock(event notify.Event)
 }
 
+// NodeReconnector is implemented by panel clients that can enumerate nodes and
+// trigger a core restart. It is optional so tests and alternative clients do
+// not need it unless the failsafe is enabled.
+type NodeReconnector interface {
+	ListEnabledNodes(ctx context.Context) ([]panel.Node, error)
+	ReconnectNode(ctx context.Context, id int) error
+}
+
+// FailsafeNotifier is optional. It reports the result of the all-node
+// reconnect to the administrator.
+type FailsafeNotifier interface {
+	Failsafe(event notify.Event, reconnected, failed []string, cause error)
+}
+
 // FailureNotifier is optional. When implemented, transport failures and
 // irreversible API errors are reported to the administrator.
 type FailureNotifier interface {
@@ -61,6 +75,16 @@ type Manager struct {
 	// detectionTimes holds the recent torrent-tagged line timestamps per
 	// identity for the DetectionThreshold sliding window.
 	detectionTimes map[string][]time.Time
+
+	// whitelist is the set of exempt identities (captured email, user ID, or
+	// username). whitelistLogged rate-limits the "ignored" info line.
+	whitelist       map[string]struct{}
+	whitelistLogged map[string]time.Time
+
+	// failsafeInFlight and lastFailsafe serialise and cooldown the optional
+	// all-node reconnect; both are protected by mu.
+	failsafeInFlight bool
+	lastFailsafe     time.Time
 }
 
 type cacheEntry struct {
@@ -92,18 +116,25 @@ func WithLogger(logger *log.Logger) Option {
 // New creates a Manager.
 func New(cfg *config.Config, store *storage.Store, panelClient Panel, notifier Notifier, opts ...Option) *Manager {
 	m := &Manager{
-		cfg:            cfg,
-		store:          store,
-		panel:          panelClient,
-		notifier:       notifier,
-		now:            time.Now,
-		logger:         log.New(log.Writer(), "blocker: ", log.LstdFlags),
-		identityCache:  make(map[string]cacheEntry),
-		touchLogged:    make(map[string]time.Time),
-		detectionTimes: make(map[string][]time.Time),
+		cfg:             cfg,
+		store:           store,
+		panel:           panelClient,
+		notifier:        notifier,
+		now:             time.Now,
+		logger:          log.New(log.Writer(), "blocker: ", log.LstdFlags),
+		identityCache:   make(map[string]cacheEntry),
+		touchLogged:     make(map[string]time.Time),
+		detectionTimes:  make(map[string][]time.Time),
+		whitelist:       make(map[string]struct{}),
+		whitelistLogged: make(map[string]time.Time),
 	}
 	for _, opt := range opts {
 		opt(m)
+	}
+	for _, value := range cfg.Whitelist {
+		if value = strings.TrimSpace(value); value != "" {
+			m.whitelist[value] = struct{}{}
+		}
 	}
 	m.rebuildIdentityCache()
 	return m
@@ -119,6 +150,14 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 	now := m.now()
 	duration := time.Duration(m.cfg.BlockDuration) * time.Minute
 
+	// Whitelisted identities are ignored before any panel call or journal
+	// write. An active block that predates the whitelist is not extended; it
+	// will expire normally.
+	if m.isWhitelistedIdentity(det.Identity) {
+		m.logWhitelisted(det.Identity, now)
+		return nil
+	}
+
 	// A torrent client opens many connections. Once an account is blocked,
 	// every new detection extends the timer by BlockDuration, but only the
 	// journal is touched: repeated lines do not call the panel again.
@@ -128,6 +167,7 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 				if record, found := m.store.Get(entry.Key); found && record.State == storage.StateActive {
 					if updated, extended := m.extendBlockLocked(record, det, now, duration); extended {
 						m.logExtended(updated, now)
+						m.maybeFailsafeLocked(ctx, updated, now)
 						return nil
 					}
 				}
@@ -143,6 +183,7 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 	if record, found := m.findRecordForIdentity(det.Identity); found && record.State == storage.StateActive && now.Before(record.BlockedUntil) {
 		if updated, extended := m.extendBlockLocked(record, det, now, duration); extended {
 			m.logExtended(updated, now)
+			m.maybeFailsafeLocked(ctx, updated, now)
 			return nil
 		}
 	}
@@ -154,6 +195,10 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 	user, err := m.resolve(ctx, det.Identity)
 	if err != nil {
 		return m.handleResolveFailure(ctx, det, now, duration, err)
+	}
+	if m.isWhitelistedUser(user) {
+		m.logWhitelisted(strconv.Itoa(user.ID), now)
+		return nil
 	}
 	key, err := userKey(user)
 	if err != nil {
@@ -174,6 +219,7 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 			if now.Before(existing.BlockedUntil) {
 				if updated, extended := m.extendBlockLocked(existing, det, now, duration); extended {
 					m.logExtended(updated, now)
+					m.maybeFailsafeLocked(ctx, updated, now)
 					return nil
 				}
 			}
@@ -186,6 +232,7 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 				existing.BlockedUntil = now.Add(duration)
 				existing.IP = det.IP
 				existing.State = storage.StateActive
+				existing.FailsafeTriggered = false
 				existing.Notified = true
 				existing.Attempts = 0
 				existing.NextAttempt = time.Time{}
@@ -311,6 +358,7 @@ func (m *Manager) handleResolveFailure(ctx context.Context, det logwatch.Detecti
 			if now.Before(existing.BlockedUntil) {
 				if updated, extended := m.extendBlockLocked(existing, det, now, duration); extended {
 					m.logExtended(updated, now)
+					m.maybeFailsafeLocked(ctx, updated, now)
 					return nil
 				}
 			}
@@ -780,6 +828,133 @@ func (m *Manager) extendBlockLocked(record storage.Block, det logwatch.Detection
 	return updated, true
 }
 
+// maybeFailsafeLocked starts the all-node reconnect last resort when an active
+// block has kept producing torrent detections for the configured period. It is
+// called under mu and spawns the network work so log processing is not blocked.
+func (m *Manager) maybeFailsafeLocked(ctx context.Context, record storage.Block, now time.Time) {
+	if !m.cfg.Failsafe.Enabled || record.FailsafeTriggered {
+		return
+	}
+	if record.PreExistingDisabled && !m.cfg.Failsafe.IncludePreExisting {
+		return
+	}
+	if m.isWhitelistedRecord(record) {
+		return
+	}
+	after := time.Duration(m.cfg.Failsafe.AfterMinutes) * time.Minute
+	if after <= 0 {
+		after = 20 * time.Minute
+	}
+	if record.BlockedAt.IsZero() || now.Sub(record.BlockedAt) < after {
+		return
+	}
+	if m.failsafeInFlight {
+		return
+	}
+	cooldown := time.Duration(m.cfg.Failsafe.CooldownMinutes) * time.Minute
+	if cooldown <= 0 {
+		cooldown = 60 * time.Minute
+	}
+	if !m.lastFailsafe.IsZero() && now.Sub(m.lastFailsafe) < cooldown {
+		return
+	}
+	if _, ok := m.panel.(NodeReconnector); !ok {
+		m.logf("failsafe enabled but the panel client does not support node reconnects")
+		return
+	}
+
+	// Do not persist FailsafeTriggered until the reconnect actually succeeds.
+	// If the process dies mid-run, a restart must be allowed to try again.
+	m.failsafeInFlight = true
+	m.lastFailsafe = now
+	m.logf("failsafe armed for %s (id %d): torrent traffic continued for %s after the block",
+		displayName(recordUser(record)), record.UserID, after.Round(time.Minute))
+	go m.runFailsafe(ctx, record)
+}
+
+func (m *Manager) runFailsafe(ctx context.Context, record storage.Block) {
+	reconnector, ok := m.panel.(NodeReconnector)
+	if !ok {
+		m.finishFailsafe(record, nil, nil, errors.New("panel client does not support node reconnects"), true)
+		return
+	}
+
+	nodes, err := reconnector.ListEnabledNodes(ctx)
+	if err != nil {
+		m.finishFailsafe(record, nil, nil, fmt.Errorf("list enabled nodes: %w", err), true)
+		return
+	}
+
+	// The panel excludes disabled/limited nodes for enabled=true; filter again
+	// so a stale or non-conforming response can never activate one.
+	eligible := make([]panel.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node.ID <= 0 || node.Status == panel.NodeStatusDisabled || node.Status == panel.NodeStatusLimited {
+			continue
+		}
+		eligible = append(eligible, node)
+	}
+	if len(eligible) == 0 {
+		m.finishFailsafe(record, nil, nil, errors.New("no enabled nodes to reconnect"), true)
+		return
+	}
+
+	var reconnected, failed []string
+	for _, node := range eligible {
+		if err := ctx.Err(); err != nil {
+			m.finishFailsafe(record, reconnected, failed, err, false)
+			return
+		}
+		label := node.Name
+		if label == "" {
+			label = fmt.Sprintf("node-%d", node.ID)
+		}
+		if err := reconnector.ReconnectNode(ctx, node.ID); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", label, err))
+			continue
+		}
+		reconnected = append(reconnected, label)
+	}
+
+	var cause error
+	if len(failed) > 0 {
+		cause = errors.New(strings.Join(failed, "; "))
+	}
+	m.finishFailsafe(record, reconnected, failed, cause, true)
+}
+
+func (m *Manager) finishFailsafe(record storage.Block, reconnected, failed []string, cause error, notifyAdmin bool) {
+	m.mu.Lock()
+	m.failsafeInFlight = false
+	if existing, ok := m.store.Get(record.Key); ok && existing.BlockedAt.Equal(record.BlockedAt) {
+		// A failure leaves the flag false so the next torrent line after the
+		// cooldown can retry. Success marks this block as handled.
+		existing.FailsafeTriggered = cause == nil
+		if err := m.store.Put(existing); err != nil {
+			m.logf("could not persist failsafe result for %s: %v", displayName(recordUser(existing)), err)
+		}
+	}
+	m.mu.Unlock()
+
+	if !notifyAdmin {
+		return
+	}
+	notifier, ok := m.notifier.(FailsafeNotifier)
+	if !ok {
+		return
+	}
+	event := notify.Event{
+		Username:        record.Username,
+		UserID:          record.UserID,
+		IP:              record.IP,
+		Hostname:        m.cfg.Hostname,
+		DurationMinutes: m.cfg.BlockDuration,
+		Timestamp:       m.now(),
+		TelegramID:      record.TelegramID,
+	}
+	notifier.Failsafe(event, reconnected, failed, cause)
+}
+
 // logExtended rate-limits the extension message to once per minute per user.
 func (m *Manager) logExtended(record storage.Block, now time.Time) {
 	if last, ok := m.touchLogged[record.Key]; ok && now.Sub(last) < time.Minute {
@@ -875,6 +1050,58 @@ func (m *Manager) pruneDetectionWindowLocked(now time.Time) {
 			m.detectionTimes[key] = times[first:]
 		}
 	}
+}
+
+func (m *Manager) isWhitelistedIdentity(identity string) bool {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return false
+	}
+	_, ok := m.whitelist[identity]
+	return ok
+}
+
+func (m *Manager) isWhitelistedUser(user *panel.User) bool {
+	if user == nil {
+		return false
+	}
+	if user.ID > 0 {
+		if _, ok := m.whitelist[strconv.Itoa(user.ID)]; ok {
+			return true
+		}
+	}
+	if user.Username != "" {
+		if _, ok := m.whitelist[user.Username]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) isWhitelistedRecord(record storage.Block) bool {
+	if record.UserID > 0 {
+		if _, ok := m.whitelist[strconv.Itoa(record.UserID)]; ok {
+			return true
+		}
+	}
+	if record.Username != "" {
+		if _, ok := m.whitelist[record.Username]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) logWhitelisted(label string, now time.Time) {
+	if m.whitelistLogged == nil {
+		m.whitelistLogged = make(map[string]time.Time)
+	}
+	key := "whitelist:" + label
+	if last, ok := m.whitelistLogged[key]; ok && now.Sub(last) < time.Minute {
+		return
+	}
+	m.whitelistLogged[key] = now
+	m.logf("ignoring torrent detection for whitelisted identity %s", label)
 }
 
 func (m *Manager) detectionCacheKey(identity string) string {

@@ -39,11 +39,15 @@ type Block struct {
 	BlockedUntil        time.Time `json:"blocked_until"`
 	PreviousStatus      string    `json:"previous_status"`
 	PreExistingDisabled bool      `json:"pre_existing_disabled"`
-	Unresolved          bool      `json:"unresolved,omitempty"`
-	State               string    `json:"state"`
-	Notified            bool      `json:"notified"`
-	Attempts            int       `json:"unblock_attempts"`
-	NextAttempt         time.Time `json:"next_attempt,omitempty"`
+	// FailsafeTriggered records that the all-node reconnect last resort has
+	// already run for this block. It prevents a reconnect storm from every
+	// subsequent torrent line.
+	FailsafeTriggered bool      `json:"failsafe_triggered,omitempty"`
+	Unresolved        bool      `json:"unresolved,omitempty"`
+	State             string    `json:"state"`
+	Notified          bool      `json:"notified"`
+	Attempts          int       `json:"unblock_attempts"`
+	NextAttempt       time.Time `json:"next_attempt,omitempty"`
 }
 
 // Store is a concurrency-safe JSON-backed block store.

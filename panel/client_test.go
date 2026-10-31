@@ -481,3 +481,49 @@ func TestNewRejectsEmbeddedCredentials(t *testing.T) {
 		t.Fatal("embedded credentials were accepted")
 	}
 }
+
+func TestListEnabledNodes(t *testing.T) {
+	var method, path, enabled string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		enabled = r.URL.Query().Get("enabled")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"nodes":[{"id":1,"name":"node-a","status":"connected"},{"id":2,"name":"node-b","status":"disabled"}],"total":2}`)
+	}))
+	defer server.Close()
+
+	nodes, err := newClient(t, server.URL).ListEnabledNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ListEnabledNodes: %v", err)
+	}
+	if method != http.MethodGet || path != "/api/nodes" || enabled != "true" {
+		t.Errorf("request = %s %s enabled=%q", method, path, enabled)
+	}
+	if len(nodes) != 2 || nodes[0].ID != 1 || nodes[0].Name != "node-a" || nodes[1].Status != "disabled" {
+		t.Errorf("nodes = %+v", nodes)
+	}
+}
+
+func TestReconnectNode(t *testing.T) {
+	var method, path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	if err := newClient(t, server.URL).ReconnectNode(context.Background(), 7); err != nil {
+		t.Fatalf("ReconnectNode: %v", err)
+	}
+	if method != http.MethodPost || path != "/api/nodes/7/reconnect" {
+		t.Errorf("request = %s %s", method, path)
+	}
+}
+
+func TestReconnectNodeRejectsInvalidID(t *testing.T) {
+	client := newClient(t, "http://127.0.0.1:1")
+	if err := client.ReconnectNode(context.Background(), 0); err == nil {
+		t.Fatal("expected error")
+	}
+}

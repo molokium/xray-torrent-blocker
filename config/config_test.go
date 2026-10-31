@@ -469,3 +469,56 @@ func TestDetectionToleranceValidation(t *testing.T) {
 		t.Fatal("expected validation error")
 	}
 }
+
+func TestFailsafeDefaults(t *testing.T) {
+	cfg, _, err := Load(writeConfig(t, minimalConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Failsafe.Enabled {
+		t.Error("Failsafe must default to disabled")
+	}
+	if cfg.Failsafe.AfterMinutes != DefaultFailsafeAfterMinutes {
+		t.Errorf("AfterMinutes = %d", cfg.Failsafe.AfterMinutes)
+	}
+	if cfg.Failsafe.CooldownMinutes != DefaultFailsafeCooldownMinutes {
+		t.Errorf("CooldownMinutes = %d", cfg.Failsafe.CooldownMinutes)
+	}
+	if len(cfg.Whitelist) != 0 {
+		t.Errorf("Whitelist = %v", cfg.Whitelist)
+	}
+}
+
+func TestFailsafeConfigured(t *testing.T) {
+	body := minimalConfig + `Failsafe:
+  Enabled: true
+  AfterMinutes: 20
+  CooldownMinutes: 45
+  IncludePreExisting: true
+Whitelist:
+  - "42"
+  - " alice "
+  - ""
+`
+	cfg, _, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Failsafe.Enabled || cfg.Failsafe.AfterMinutes != 20 || cfg.Failsafe.CooldownMinutes != 45 || !cfg.Failsafe.IncludePreExisting {
+		t.Errorf("Failsafe = %+v", cfg.Failsafe)
+	}
+	if len(cfg.Whitelist) != 2 || cfg.Whitelist[0] != "42" || cfg.Whitelist[1] != "alice" {
+		t.Errorf("Whitelist = %#v", cfg.Whitelist)
+	}
+}
+
+func TestFailsafeValidation(t *testing.T) {
+	body := minimalConfig + `Failsafe:
+  Enabled: true
+  AfterMinutes: 1441
+  CooldownMinutes: 10081
+`
+	if _, _, err := Load(writeConfig(t, body)); err == nil {
+		t.Fatal("expected validation error")
+	}
+}

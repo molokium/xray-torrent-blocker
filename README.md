@@ -1,6 +1,6 @@
 # PasarGuard Torrent Blocker
 
-Current build: **v0.3.1-pg.8**
+Current build: **v0.3.1-pg.9**
 
 A fork of [kutovoys/xray-torrent-blocker](https://github.com/kutovoys/xray-torrent-blocker)
 based on **v0.3.1**, the last release with Telegram support, reworked to block
@@ -23,6 +23,7 @@ the administrator and (optionally) the user are preserved from v0.3.1.
 | Block journal | `blocked_ips.json` | `blocks.json`, with pending/active states |
 | Restart behaviour | re-adds firewall rules | re-schedules panel unblocks |
 | Already-disabled users | n/a | recorded, never re-enabled by tblocker |
+| Stuck torrent sessions | n/a | optional all-enabled-node reconnect failsafe |
 
 There is **no code path that executes `ufw`, `iptables`, `nft`, `ipset`, or
 `conntrack`**. `BlockMode` and `BypassIPS` from old configs are ignored with a
@@ -52,6 +53,11 @@ For every access-log line containing `TorrentTag`:
    `BlockedUntil` passes it reads the user again and, if the account is still
    disabled, sends `{"disabled":false}`. The panel then restores the correct
    status (`active`, `limited`, `expired`, or `on_hold`).
+9. If `Failsafe.Enabled` is true and a tblocker-created block keeps producing
+   torrent lines after `Failsafe.AfterMinutes`, tblocker lists the panel's
+   enabled nodes and calls `POST /api/nodes/{id}/reconnect` for each one. That
+   restarts the node core and drops established connections. Disabled and
+   limited nodes are skipped, and a global cooldown prevents reconnect storms.
 
 `BlockDuration` is therefore an **idle timeout**, not a fixed duration from the
 first detection. A user who keeps torrenting stays blocked; the timer starts
@@ -84,6 +90,74 @@ Counters are in memory and pruned by the expiry worker; they are not persisted,
 so a restart starts a fresh detection burst. That is intentional: the journal
 still remembers active blocks, while the tolerance only decides whether a new
 block should start.
+
+### Whitelist
+
+Identities in `Whitelist` are never blocked:
+
+```yaml
+Whitelist:
+  - "42"
+  - "alice"
+```
+
+Values are matched exactly against the captured `email:` value, the PasarGuard
+numeric user ID, and the PasarGuard username. PasarGuard normally writes the
+numeric user ID into the Xray email field, so numeric strings are the usual
+form; usernames are also accepted. A whitelist match on the captured identity
+is handled before any panel call. A username match after resolution still costs
+one read, but never a disable. Whitelisting a user does not immediately lift an
+existing block; it stops new blocks and stops extending an active one, so the
+existing block expires normally. Entries are case-sensitive; no wildcards or
+CIDR ranges are accepted.
+
+### Failsafe node reconnect
+
+Disabling an account prevents new Xray sessions, but Xray can keep an existing
+session alive. If a blocked user keeps torrenting after a grace period, the
+optional failsafe restarts the node cores:
+
+```yaml
+Failsafe:
+  Enabled: true
+  AfterMinutes: 20
+  CooldownMinutes: 60
+  IncludePreExisting: false
+```
+
+When a tblocker-created block keeps generating detections for
+`AfterMinutes`, tblocker:
+
+1. Lists nodes with `GET /api/nodes?enabled=true`.
+2. Skips every node whose status is `disabled` or `limited`.
+3. Calls `POST /api/nodes/{id}/reconnect` for every remaining node.
+4. Records the block as failsafe-triggered, so later torrent lines for that
+   block do not restart the network again.
+5. Sends an admin Telegram result when `SendAdminMessage` is true.
+
+`CooldownMinutes` is global across users. If another block triggers the
+failsafe during the cooldown, it waits for a later torrent line after the
+cooldown. A failed reconnect leaves the block eligible for a retry after the
+cooldown. The failsafe is deliberately **not** applied to accounts that were
+already disabled before tblocker touched them unless `IncludePreExisting: true`;
+those may be administrator-managed.
+
+`POST /api/nodes/{id}/reconnect` is a real core restart, not just a panel
+control-plane reconnect. In PasarGuard it reaches
+`restart_node` -> `connect_single_node(force_start=True)` ->
+`_start_or_attach_node`, which stops the node backend and starts it again. In
+the node agent, `Stop` shuts down the Xray backend and kills the Xray process;
+`Start` launches a fresh Xray process. For a WireGuard-backed node the same
+endpoint restarts WireGuard instead of Xray; every enabled node is still
+reconnected, as requested, but the Xray-specific effect applies to Xray nodes.
+
+Enabling this feature requires `nodes.read` and `nodes.reconnect` on the panel
+API key, in addition to `users.read` and `users.update`. Restarting cores
+interrupts every user on the affected nodes briefly; that is the trade-off for
+cutting off an established torrent session. Node reconnects use a separate
+3-minute per-request timeout (not the normal `PasarGuard.TimeoutSeconds`) and
+are not automatically retried, because a request that timed out may still have
+restarted the core; a timeout is reported as a failsafe failure.
 
 The journal is written before the API call. If the process dies or the panel
 times out mid-request, the pending record is reconciled on the next tick: if the
@@ -136,7 +210,8 @@ Telegram is disabled, failures are only logged.
 - A PasarGuard node whose Xray access log is written to a file, with the
   `email` field present.
 - A panel API key with `users:read` and `users:update`. Scope must cover every
-  user you want the blocker to police.
+  user you want the blocker to police. The optional failsafe also needs
+  `nodes:read` and `nodes:reconnect`.
 - Linux (the binary is a single static executable).
 
 ## PasarGuard setup
@@ -147,8 +222,10 @@ Panel → **API Keys** → create a key:
 
 - name: `tblocker`
 - permissions: `users` → `read`, `users` → `update`
+- when `Failsafe.Enabled` is true, also `nodes` → `read` and
+  `nodes` → `reconnect`
 - scope: `all` (or `own` when the key belongs to the admin that owns the
-  users you want to police)
+  users and nodes you want to police)
 - `inherit_permissions` can also be used with an owner/admin account that has
   those permissions.
 
@@ -280,6 +357,11 @@ The full annotated file is [`config.yaml.example`](config.yaml.example).
 | `TorrentTag` | `TORRENT` | substring that marks a torrent line |
 | `DetectionThreshold` | `1` | torrent lines required before a block (1 = immediate) |
 | `DetectionWindowMinutes` | `5` | sliding window for the threshold |
+| `Whitelist` | empty | exact identities exempt from blocking |
+| `Failsafe.Enabled` | `false` | all-enabled-node reconnect last resort |
+| `Failsafe.AfterMinutes` | `20` | continued detections before the failsafe fires |
+| `Failsafe.CooldownMinutes` | `60` | global cooldown between failsafe runs |
+| `Failsafe.IncludePreExisting` | `false` | also trigger for pre-existing-disabled accounts |
 | `StorageDir` | `/opt/tblocker` | directory for `blocks.json` |
 | `Hostname` | system hostname | name in admin notifications |
 | `CheckIntervalSeconds` | `15` | expiry worker interval (5–3600) |
@@ -531,6 +613,14 @@ run one instance per `StorageDir`, and sign or checksum the binary you deploy.
 - Detection-tolerance counters are in memory. A restart starts a fresh burst, and
   a false-positive rate at or above `DetectionThreshold` still blocks; tune the
   threshold above the noise you actually see.
+- Whitelist entries are exact strings and case-sensitive. A whitelist match does
+  not cancel an already active block; it stops new blocks and lets the current
+  one expire.
+- The failsafe restarts **every enabled node**, not just the node carrying the
+  user. Expect a brief interruption for all users on those nodes. Disabled and
+  limited nodes are skipped, and `CooldownMinutes` limits repeated runs.
+- The failsafe needs `nodes.read` + `nodes.reconnect`. If the key lacks them,
+  the block itself still works, but the failsafe reports an admin failure.
 - The panel API does not report who changed a user's status. If an
   administrator disables a user during a tblocker block, the expiry worker may
   enable them again. Set `ReenableOnUnblock: false` if that race matters.

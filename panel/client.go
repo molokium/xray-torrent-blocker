@@ -36,6 +36,24 @@ const (
 	StatusOnHold   = "on_hold"
 )
 
+// Node is the subset of a PasarGuard node needed by the failsafe.
+type Node struct {
+	ID     int    `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+// PasarGuard node statuses used by the failsafe filter.
+const (
+	NodeStatusDisabled = "disabled"
+	NodeStatusLimited  = "limited"
+)
+
+type nodesResponse struct {
+	Nodes []Node `json:"nodes"`
+	Total int    `json:"total"`
+}
+
 // APIError is returned for non-2xx panel responses.
 type APIError struct {
 	StatusCode int
@@ -77,13 +95,14 @@ func IsDefinitive(err error) bool {
 
 // Client talks to a PasarGuard panel.
 type Client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
-	retries    int
-	retryBase  time.Duration
-	userAgent  string
-	insecure   bool
+	baseURL         string
+	apiKey          string
+	httpClient      *http.Client
+	reconnectClient *http.Client
+	retries         int
+	retryBase       time.Duration
+	userAgent       string
+	insecure        bool
 }
 
 // Option customises a Client.
@@ -195,6 +214,15 @@ func New(baseURL, apiKey string, timeout time.Duration, opts ...Option) (*Client
 		}
 	}
 
+	// A PasarGuard node reconnect stops and starts the core and waits for the
+	// new core. That can take much longer than a normal user API call, so give
+	// it a separate long timeout. Retries are disabled for this operation: a
+	// timed-out request may still have restarted the core, and retrying would
+	// restart it again.
+	reconnectClient := *c.httpClient
+	reconnectClient.Timeout = 3 * time.Minute
+	c.reconnectClient = &reconnectClient
+
 	return c, nil
 }
 
@@ -265,6 +293,27 @@ type Admin struct {
 	Status   string `json:"status"`
 }
 
+// ListEnabledNodes returns nodes that PasarGuard considers enabled. The panel
+// excludes disabled and limited nodes from this query; the caller filters the
+// status again as a defensive check.
+func (c *Client) ListEnabledNodes(ctx context.Context) ([]Node, error) {
+	var response nodesResponse
+	if err := c.do(ctx, http.MethodGet, "/api/nodes?enabled=true", nil, &response); err != nil {
+		return nil, err
+	}
+	return response.Nodes, nil
+}
+
+// ReconnectNode asks PasarGuard to reconnect one node. On the node side this
+// stops the running core and starts it again, which drops established
+// connections that a panel-side disable could not terminate.
+func (c *Client) ReconnectNode(ctx context.Context, id int) error {
+	if id <= 0 {
+		return fmt.Errorf("invalid PasarGuard node ID %d", id)
+	}
+	return c.doWithClient(ctx, http.MethodPost, fmt.Sprintf("/api/nodes/%d/reconnect", id), nil, nil, c.reconnectClient, 0)
+}
+
 // GetCurrentAdmin verifies the base URL and credentials.
 func (c *Client) GetCurrentAdmin(ctx context.Context) (*Admin, error) {
 	var admin Admin
@@ -289,6 +338,10 @@ func (c *Client) Check(ctx context.Context) error {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
+	return c.doWithClient(ctx, method, path, body, out, c.httpClient, c.retries)
+}
+
+func (c *Client) doWithClient(ctx context.Context, method, path string, body any, out any, httpClient *http.Client, retries int) error {
 	var payload []byte
 	var err error
 	if body != nil {
@@ -312,12 +365,12 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		}
 		c.setAuth(req)
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return fmt.Errorf("%s %s: %w", method, path, ctx.Err())
 			}
-			if attempt >= c.retries {
+			if attempt >= retries {
 				return fmt.Errorf("%s %s: %w", method, path, err)
 			}
 			if !sleepContext(ctx, c.backoff(attempt)) {
@@ -329,7 +382,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 		closeErr := resp.Body.Close()
 		if readErr != nil {
-			if attempt >= c.retries {
+			if attempt >= retries {
 				return fmt.Errorf("read %s %s response: %w", method, path, readErr)
 			}
 			if !sleepContext(ctx, c.backoff(attempt)) {
@@ -362,7 +415,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 			Path:       path,
 			Detail:     detail,
 		}
-		if isRetryableStatus(resp.StatusCode) && attempt < c.retries {
+		if isRetryableStatus(resp.StatusCode) && attempt < retries {
 			wait := retryAfter(resp, c.backoff(attempt))
 			if !sleepContext(ctx, wait) {
 				return fmt.Errorf("%s %s: %w", method, path, ctx.Err())

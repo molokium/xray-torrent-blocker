@@ -1,26 +1,27 @@
 # QA record
 
-Version: `v0.3.1-pg.8` (fork of xray-torrent-blocker v0.3.1)
+Version: `v0.3.1-pg.9` (fork of xray-torrent-blocker v0.3.1)
 
 ## Environment
 
 - Ubuntu 26.04, Linux 7.0.0-38-generic
 - Go 1.24.6 (module targets Go 1.22)
 - PasarGuard panel v5.5.1, SQLite database, owner + API key with
-  `users.read` / `users.update` scope `all`
+  `users.read` / `users.update` scope `all`; the failsafe additionally needs
+  `nodes.read` / `nodes.reconnect`
 - One disposable PasarGuard user (`id=1`, `username=alice`)
 
 ## Automated tests
 
 ```text
 $ go test -race -shuffle=on -cover ./...
-ok  tblocker            1.040s  coverage: 10.6% of statements
-ok  tblocker/blocker    1.206s  coverage: 72.4% of statements
-ok  tblocker/config     1.066s  coverage: 92.8% of statements
-ok  tblocker/logwatch   7.189s  coverage: 86.2% of statements
-ok  tblocker/notify     1.343s  coverage: 82.4% of statements
-ok  tblocker/panel      1.543s  coverage: 78.9% of statements
-ok  tblocker/storage    1.111s  coverage: 82.1% of statements
+ok  tblocker            1.033s  coverage: 10.1% of statements
+ok  tblocker/blocker    1.257s  coverage: 73.1% of statements
+ok  tblocker/config     1.059s  coverage: 93.2% of statements
+ok  tblocker/logwatch   7.192s  coverage: 86.2% of statements
+ok  tblocker/notify     1.332s  coverage: 80.0% of statements
+ok  tblocker/panel      1.556s  coverage: 80.0% of statements
+ok  tblocker/storage    1.120s  coverage: 82.1% of statements
 ```
 
 `go vet ./...` is clean. `gofmt -l .` is empty. `shellcheck install.sh` and
@@ -60,6 +61,19 @@ The security review in `README.md` is backed by these tests:
 | `TestDetectionToleranceDefaults` | absent keys preserve immediate blocking |
 | `TestDetectionToleranceConfigured` | explicit threshold/window are loaded |
 | `TestDetectionToleranceValidation` | out-of-range tolerance is rejected |
+| `TestListEnabledNodes` | node list uses `GET /api/nodes?enabled=true` |
+| `TestReconnectNode` | reconnect uses `POST /api/nodes/{id}/reconnect` |
+| `TestReconnectNodeRejectsInvalidID` | invalid node IDs are rejected before a request |
+| `TestFailsafeReconnectsAllEnabledNodesAfterDelay` | after the grace period, every enabled node is reconnected; disabled/limited nodes are skipped |
+| `TestFailsafeSkipsPreExistingDisabledByDefault` | pre-existing-disabled blocks do not restart nodes by default |
+| `TestFailsafeIncludesPreExistingWhenConfigured` | opt-in pre-existing handling works |
+| `TestFailsafeFailureIsReportedAndRetryable` | failed reconnect is alerted and retried after cooldown |
+| `TestFailsafeDefaults` | the failsafe is disabled by default |
+| `TestFailsafeConfigured` | failsafe and whitelist values load and normalize |
+| `TestFailsafeValidation` | out-of-range failsafe values are rejected |
+| `TestWhitelistSkipsIdentityWithoutPanelCall` | whitelisted identity causes no panel call or record |
+| `TestWhitelistMatchesUsernameAfterResolve` | username whitelist works after one resolve |
+| `TestTelegramFailsafeSendsAdminOnly` | failsafe result goes to the admin chat |
 
 ## Detection tolerance (pg.8)
 
@@ -79,6 +93,46 @@ is cleared when it fires.
   and `TestActiveBlockBypassesDetectionThreshold` cover the behavior;
   `TestDetectionToleranceDefaults`, `TestDetectionToleranceConfigured`, and
   `TestDetectionToleranceValidation` cover config loading.
+
+## Failsafe and whitelist (pg.9)
+
+### Node reconnect semantics
+
+Verified in the PasarGuard panel and node source, not just the UI label:
+
+- `POST /api/nodes/{node_id}/reconnect` calls `NodeOperator.restart_node`.
+- `restart_node` calls `connect_single_node(..., force_start=True)`.
+- `NodeOperation._start_or_attach_node` uses the default `stop_first=True`,
+  calls `pg_node.stop()`, then `pg_node.start(...)` with a fresh Xray config and
+  user snapshot.
+- In the node agent, `Stop` calls `Controller.Disconnect`, which shuts down the
+  Xray backend; `Core.Stop` kills and reaps the Xray process, removes its
+  sockets, and `Core.Start` launches a new process.
+- For a WireGuard-backed node the same endpoint restarts WireGuard, not Xray.
+
+So the failsafe is a real core restart, not merely a control-plane reconnect.
+The all-nodes endpoint exists, but tblocker enumerates nodes itself so it can
+skip disabled and limited nodes before issuing per-node reconnects.
+
+### Implementation
+
+- `Failsafe.Enabled` is optional and off by default.
+- The trigger is a tblocker-created active block that continues producing
+  torrent detections after `Failsafe.AfterMinutes`; `IncludePreExisting` opts
+  into already-disabled accounts as well.
+- `GET /api/nodes?enabled=true` is filtered again for `disabled`/`limited`;
+  only the remaining nodes receive `POST /api/nodes/{id}/reconnect`.
+- Node reconnects use a separate 3-minute timeout and no automatic retries, so
+  a timed-out request that still restarted the core is not restarted again.
+- Reconnects are sequential, a global `CooldownMinutes` prevents storms, and a
+  successful block is marked `failsafe_triggered` in `blocks.json`; a failed
+  attempt is reported to the admin and reset for a later retry.
+- `Whitelist` is an exact, case-sensitive list matched against the captured
+  identity, numeric user ID, and username. A whitelisted identity is ignored
+  before any panel request; a whitelist match after resolution still avoids a
+  disable.
+
+Tests cover all of the above; `go test -race` and `go vet` are clean.
 
 ## Performance and later-version ports
 
@@ -135,10 +189,12 @@ avg_parse=0s goroutines=4 heap_mb=1 gc=0 uptime=2s
 
 ## Black-box binary test (fake PasarGuard)
 
-`python3 qa/e2e.py` passed on `v0.3.1-pg.8` after the parser, queue,
-inotify/polling, complete-line, security, non-root, sliding-expiry, and
-detection-tolerance changes. It starts the real binary as the unprivileged
-current user and verifies:
+`python3 qa/e2e.py` passed on `v0.3.1-pg.9` after the parser, queue,
+inotify/polling, complete-line, security, non-root, sliding-expiry,
+detection-tolerance, and failsafe/whitelist changes. The E2E does not
+drive the failsafe or whitelist paths itself; those are covered by the unit and
+HTTP contract tests above. It starts the real binary as the unprivileged current
+user and verifies:
 
 - `PUT /api/user/by-id/42/disabled` with `{"disabled":true}`
 - `X-Api-Key` header
@@ -158,10 +214,12 @@ current user and verifies:
 `python3 qa/live_panel.py` against PasarGuard v5.5.1 passed on
 `v0.3.1-pg.4` after the parser and hardening changes. pg.5 changed the service
 unit/installer, pg.6 added sliding expiry, pg.7 added retries/failure alerts,
-and pg.8 added detection tolerance; the panel request contract is unchanged.
-The pg.8 E2E uses `DetectionThreshold: 10` and covers the threshold, active-block
-bypass, normal blocking, expiry, and the sliding timer; retry/restart edge cases
-are covered by unit tests. It verified:
+pg.8 added detection tolerance, and pg.9 added the failsafe and whitelist; the
+user/block panel request contract is unchanged. The pg.9 E2E uses
+`DetectionThreshold: 10` and covers the threshold, active-block bypass, normal
+blocking, expiry, and the sliding timer. Node reconnect was verified from the
+PasarGuard panel/node source and by HTTP contract tests; no real node core was
+restarted in this test environment. It verified:
 
 - numeric ID (`email: 1`, `Identifier: auto`)
 - username mode (`Identifier: username`)

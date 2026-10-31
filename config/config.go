@@ -27,6 +27,11 @@ const (
 	DefaultDetectionThreshold = 1
 	// DefaultDetectionWindowMinutes is the sliding window for the threshold.
 	DefaultDetectionWindowMinutes = 5
+	// DefaultFailsafeAfterMinutes is how long a tblocker block may keep
+	// producing torrent traffic before the node-reconnect failsafe fires.
+	DefaultFailsafeAfterMinutes = 20
+	// DefaultFailsafeCooldownMinutes prevents a storm of all-node reconnects.
+	DefaultFailsafeCooldownMinutes = 60
 )
 
 const (
@@ -96,6 +101,20 @@ func (p PasarGuardConfig) StartupCheckEnabled() bool {
 	return p.StartupCheck == nil || *p.StartupCheck
 }
 
+// FailsafeConfig controls the optional node-reconnect last resort. When a
+// tblocker-created block keeps producing torrent detections after
+// AfterMinutes, every enabled PasarGuard node is told to reconnect (restart
+// its core). Disabled and limited nodes are never touched.
+type FailsafeConfig struct {
+	Enabled         bool `yaml:"Enabled"`
+	AfterMinutes    int  `yaml:"AfterMinutes"`
+	CooldownMinutes int  `yaml:"CooldownMinutes"`
+	// IncludePreExisting also applies the failsafe to accounts that were
+	// already disabled before tblocker first saw them. Default: false, because
+	// those may be administrator-managed accounts.
+	IncludePreExisting bool `yaml:"IncludePreExisting"`
+}
+
 // Config is the validated runtime configuration.
 type Config struct {
 	LogFile       string `yaml:"LogFile"`
@@ -106,10 +125,17 @@ type Config struct {
 	// the tolerance and blocks on the first line.
 	DetectionThreshold int `yaml:"DetectionThreshold"`
 	// DetectionWindowMinutes is the sliding window for DetectionThreshold.
-	DetectionWindowMinutes int    `yaml:"DetectionWindowMinutes"`
-	StorageDir             string `yaml:"StorageDir"`
-	Hostname               string `yaml:"Hostname"`
-	CheckIntervalSeconds   int    `yaml:"CheckIntervalSeconds"`
+	DetectionWindowMinutes int `yaml:"DetectionWindowMinutes"`
+	// Whitelist contains identities exempt from blocking. Values are matched
+	// exactly against the captured email value, the PasarGuard user ID, and the
+	// PasarGuard username. PasarGuard normally uses the numeric user ID as the
+	// Xray email, so numeric strings are the common form.
+	Whitelist []string `yaml:"Whitelist"`
+	// Failsafe is optional and disabled by default.
+	Failsafe             FailsafeConfig `yaml:"Failsafe"`
+	StorageDir           string         `yaml:"StorageDir"`
+	Hostname             string         `yaml:"Hostname"`
+	CheckIntervalSeconds int            `yaml:"CheckIntervalSeconds"`
 	// UsePolling switches the log follower from inotify to stat polling.
 	// Polling is slower but works on filesystems with unreliable inotify.
 	UsePolling bool `yaml:"UsePolling"`
@@ -247,6 +273,19 @@ func applyDefaults(cfg *Config) {
 	if cfg.DetectionWindowMinutes <= 0 {
 		cfg.DetectionWindowMinutes = DefaultDetectionWindowMinutes
 	}
+	if cfg.Failsafe.AfterMinutes <= 0 {
+		cfg.Failsafe.AfterMinutes = DefaultFailsafeAfterMinutes
+	}
+	if cfg.Failsafe.CooldownMinutes <= 0 {
+		cfg.Failsafe.CooldownMinutes = DefaultFailsafeCooldownMinutes
+	}
+	trimmedWhitelist := cfg.Whitelist[:0]
+	for _, value := range cfg.Whitelist {
+		if value = strings.TrimSpace(value); value != "" {
+			trimmedWhitelist = append(trimmedWhitelist, value)
+		}
+	}
+	cfg.Whitelist = trimmedWhitelist
 	if strings.TrimSpace(cfg.StorageDir) == "" {
 		cfg.StorageDir = DefaultStorageDir
 	}
@@ -319,6 +358,12 @@ func validate(cfg *Config) error {
 	}
 	if cfg.DetectionWindowMinutes < 1 || cfg.DetectionWindowMinutes > 1440 {
 		errs = append(errs, errors.New("DetectionWindowMinutes must be between 1 and 1440"))
+	}
+	if cfg.Failsafe.AfterMinutes < 1 || cfg.Failsafe.AfterMinutes > 1440 {
+		errs = append(errs, errors.New("Failsafe.AfterMinutes must be between 1 and 1440"))
+	}
+	if cfg.Failsafe.CooldownMinutes < 1 || cfg.Failsafe.CooldownMinutes > 10080 {
+		errs = append(errs, errors.New("Failsafe.CooldownMinutes must be between 1 and 10080"))
 	}
 	if cfg.CheckIntervalSeconds < 5 || cfg.CheckIntervalSeconds > 3600 {
 		errs = append(errs, errors.New("CheckIntervalSeconds must be between 5 and 3600"))

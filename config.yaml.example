@@ -23,6 +23,28 @@ TorrentTag: "TORRENT"
 DetectionThreshold: 10
 DetectionWindowMinutes: 5
 
+# Optional. Identities that may torrent without being blocked. Values are
+# matched exactly against the captured email value, the PasarGuard user ID, and
+# the PasarGuard username. PasarGuard normally writes the numeric user ID into
+# the Xray email field, so numeric strings are the common form.
+# Whitelist:
+#   - "42"
+#   - "alice"
+
+# Optional last-resort failsafe. If a tblocker-created block keeps producing
+# torrent detections after AfterMinutes, tblocker asks PasarGuard to reconnect
+# every enabled node (excluding disabled and limited nodes), which restarts
+# their cores and drops established connections.
+#
+# Requires the API key to have BOTH nodes.read and nodes.reconnect.
+# Disabled by default. IncludePreExisting is false by default so accounts that
+# were already disabled before tblocker acted are not used as a trigger.
+# Failsafe:
+#   Enabled: true
+#   AfterMinutes: 20
+#   CooldownMinutes: 60
+#   IncludePreExisting: false
+
 # Directory for blocks.json, the durable block journal. Keep it on persistent
 # storage: it is what lets the service re-enable users after a restart. It must
 # be writable by the tblocker service user (0750, owned tblocker:tblocker).
@@ -47,9 +69,11 @@ PasarGuard:
   BaseURL: "https://panel.example.com"
 
   # API key created in the panel (API Keys page). It needs:
-  #   users:read   - resolve a user and read its current status
-  #   users:update - disable and re-enable the account
-  # with scope "all" (or at least access to every user you want to police).
+  #   users:read      - resolve a user and read its current status
+  #   users:update    - disable and re-enable the account
+  #   nodes:read      - only needed when Failsafe.Enabled is true
+  #   nodes:reconnect - only needed when Failsafe.Enabled is true
+  # with scope "all" (or at least access to every user/node you want to police).
   #
   # A PasarGuard API key starts with pg_key_ and is sent as X-Api-Key.
   # An admin JWT is also accepted and is sent as a Bearer token, but it expires.

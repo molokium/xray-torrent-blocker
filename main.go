@@ -85,6 +85,15 @@ func main() {
 		} else {
 			log.Printf("PasarGuard API check OK (%s)", cfg.PasarGuard.BaseURL)
 		}
+		if cfg.Failsafe.Enabled {
+			checkCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.PasarGuard.TimeoutSeconds)*time.Second)
+			if _, err := panelClient.ListEnabledNodes(checkCtx); err != nil {
+				log.Printf("ERROR: failsafe node check failed (nodes.read is required): %v", err)
+			} else {
+				log.Printf("failsafe node check OK")
+			}
+			cancel()
+		}
 	}
 
 	stats := newRuntimeStats()

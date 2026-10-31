@@ -346,3 +346,31 @@ func TestTelegramFailureSendsAdmin(t *testing.T) {
 		t.Fatal("timed out waiting for failure notification")
 	}
 }
+
+func TestTelegramFailsafeSendsAdminOnly(t *testing.T) {
+	requests := make(chan telegramRequest, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		requests <- telegramRequest{path: r.URL.Path, form: r.PostForm}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.TelegramAPIURL = server.URL
+	dispatcher := New(cfg)
+	dispatcher.Failsafe(Event{Username: "alice", UserID: 42}, []string{"node-a", "node-b"}, nil, nil)
+
+	select {
+	case req := <-requests:
+		if got := first(req.form["chat_id"]); got != "999" {
+			t.Errorf("chat_id = %q, want admin", got)
+		}
+		text := first(req.form["text"])
+		if !strings.Contains(text, "failsafe") || !strings.Contains(text, "node-a") {
+			t.Errorf("text = %q", text)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for failsafe notification")
+	}
+}

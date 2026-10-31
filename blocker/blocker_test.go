@@ -39,6 +39,12 @@ type fakePanel struct {
 	getErr           error
 	setErr           error
 	applyEvenOnError bool
+
+	nodes          []panel.Node
+	nodesErr       error
+	reconnectErr   error
+	reconnectedIDs []int
+	nodeListCalls  int
 }
 
 func newFakePanel(users ...*panel.User) *fakePanel {
@@ -173,6 +179,38 @@ func (f *fakePanel) counts() (int, int) {
 	return f.getByIDCalls, f.getByNameCalls
 }
 
+func (f *fakePanel) ListEnabledNodes(_ context.Context) ([]panel.Node, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nodeListCalls++
+	if f.nodesErr != nil {
+		return nil, f.nodesErr
+	}
+	return append([]panel.Node(nil), f.nodes...), nil
+}
+
+func (f *fakePanel) ReconnectNode(_ context.Context, id int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reconnectErr != nil {
+		return f.reconnectErr
+	}
+	f.reconnectedIDs = append(f.reconnectedIDs, id)
+	return nil
+}
+
+func (f *fakePanel) reconnected() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.reconnectedIDs...)
+}
+
+func (f *fakePanel) nodeListCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nodeListCalls
+}
+
 func (f *fakePanel) setError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -196,10 +234,18 @@ type fakeFailure struct {
 }
 
 type fakeNotifier struct {
-	mu       sync.Mutex
-	blocks   []notify.Event
-	unblocks []notify.Event
-	failures []fakeFailure
+	mu        sync.Mutex
+	blocks    []notify.Event
+	unblocks  []notify.Event
+	failures  []fakeFailure
+	failsafes []fakeFailsafe
+}
+
+type fakeFailsafe struct {
+	event       notify.Event
+	reconnected []string
+	failed      []string
+	cause       error
 }
 
 func (n *fakeNotifier) Block(event notify.Event) {
@@ -230,6 +276,23 @@ func (n *fakeNotifier) Failure(event notify.Event, action string, cause error, a
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.failures = append(n.failures, fakeFailure{event: event, action: action, cause: cause, attempt: attempt, retry: retry})
+}
+
+func (n *fakeNotifier) Failsafe(event notify.Event, reconnected, failed []string, cause error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.failsafes = append(n.failsafes, fakeFailsafe{
+		event:       event,
+		reconnected: append([]string(nil), reconnected...),
+		failed:      append([]string(nil), failed...),
+		cause:       cause,
+	})
+}
+
+func (n *fakeNotifier) failsafeEvents() []fakeFailsafe {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]fakeFailsafe(nil), n.failsafes...)
 }
 
 func (n *fakeNotifier) failureEvents() []fakeFailure {
@@ -1383,5 +1446,233 @@ func TestActiveBlockBypassesDetectionThreshold(t *testing.T) {
 	}
 	if calls := fp.calls(); len(calls) != 0 {
 		t.Errorf("panel called for an active block: %+v", calls)
+	}
+}
+
+func waitForCondition(t *testing.T, description string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
+}
+
+func TestFailsafeReconnectsAllEnabledNodesAfterDelay(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	fp.nodes = []panel.Node{
+		{ID: 1, Name: "node-a", Status: "connected"},
+		{ID: 2, Name: "node-b", Status: panel.NodeStatusDisabled},
+		{ID: 3, Name: "node-c", Status: panel.NodeStatusLimited},
+		{ID: 4, Name: "node-d", Status: "connected"},
+	}
+	cfg := testConfig()
+	cfg.BlockDuration = 30
+	cfg.Failsafe = config.FailsafeConfig{Enabled: true, AfterMinutes: 20, CooldownMinutes: 60}
+	manager, notifier, store := newTestManager(t, cfg, fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "203.0.113.9", "")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "203.0.113.9", "")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "203.0.113.9", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForCondition(t, "failsafe reconnect", func() bool {
+		return len(fp.reconnected()) == 2 && len(notifier.failsafeEvents()) == 1
+	})
+	if got := fp.reconnected(); len(got) != 2 || got[0] != 1 || got[1] != 4 {
+		t.Fatalf("reconnected nodes = %v, want [1 4]", got)
+	}
+	record := mustBlock(t, store, "id:7")
+	if !record.FailsafeTriggered {
+		t.Errorf("FailsafeTriggered = false")
+	}
+	events := notifier.failsafeEvents()
+	if len(events) != 1 || events[0].cause != nil {
+		t.Fatalf("failsafe events = %+v", events)
+	}
+	if len(events[0].reconnected) != 2 || events[0].reconnected[0] != "node-a" || events[0].reconnected[1] != "node-d" {
+		t.Errorf("reconnected names = %v", events[0].reconnected)
+	}
+
+	// Once the failsafe has run for this block, subsequent lines must not
+	// restart every node again.
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fp.nodeListCount(); calls != 1 {
+		t.Errorf("node list calls = %d, want 1", calls)
+	}
+	if calls := fp.calls(); len(calls) != 1 {
+		t.Errorf("user disable calls = %d, want 1", len(calls))
+	}
+}
+
+func TestFailsafeSkipsPreExistingDisabledByDefault(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusDisabled})
+	fp.nodes = []panel.Node{{ID: 1, Name: "node-a", Status: "connected"}}
+	cfg := testConfig()
+	cfg.BlockDuration = 30
+	cfg.Failsafe = config.FailsafeConfig{Enabled: true, AfterMinutes: 20, CooldownMinutes: 60}
+	manager, _, store := newTestManager(t, cfg, fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	record := mustBlock(t, store, "id:7")
+	if !record.PreExistingDisabled {
+		t.Fatalf("record = %+v", record)
+	}
+	if record.FailsafeTriggered {
+		t.Error("pre-existing block triggered failsafe without IncludePreExisting")
+	}
+	if calls := fp.nodeListCount(); calls != 0 {
+		t.Errorf("node list calls = %d, want 0", calls)
+	}
+	if got := fp.reconnected(); len(got) != 0 {
+		t.Errorf("reconnected = %v", got)
+	}
+}
+
+func TestFailsafeIncludesPreExistingWhenConfigured(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusDisabled})
+	fp.nodes = []panel.Node{{ID: 1, Name: "node-a", Status: "connected"}}
+	cfg := testConfig()
+	cfg.BlockDuration = 30
+	cfg.Failsafe = config.FailsafeConfig{
+		Enabled:            true,
+		AfterMinutes:       20,
+		CooldownMinutes:    60,
+		IncludePreExisting: true,
+	}
+	manager, notifier, _ := newTestManager(t, cfg, fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, "pre-existing failsafe", func() bool {
+		return len(fp.reconnected()) == 1 && len(notifier.failsafeEvents()) == 1
+	})
+}
+
+func TestWhitelistSkipsIdentityWithoutPanelCall(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	cfg := testConfig()
+	cfg.Whitelist = []string{"7", "  ", "alice"}
+	manager, notifier, store := newTestManager(t, cfg, fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Errorf("disable calls = %+v", calls)
+	}
+	if idCalls, nameCalls := fp.counts(); idCalls != 0 || nameCalls != 0 {
+		t.Errorf("panel queries = id:%d name:%d", idCalls, nameCalls)
+	}
+	if store.Len() != 0 {
+		t.Errorf("store = %+v", store.List())
+	}
+	if len(notifier.blockEvents()) != 0 {
+		t.Errorf("block events = %d", len(notifier.blockEvents()))
+	}
+}
+
+func TestWhitelistMatchesUsernameAfterResolve(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	cfg := testConfig()
+	cfg.Whitelist = []string{"alice"}
+	manager, notifier, store := newTestManager(t, cfg, fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Errorf("disable calls = %+v", calls)
+	}
+	if idCalls, nameCalls := fp.counts(); idCalls != 1 || nameCalls != 0 {
+		t.Errorf("panel queries = id:%d name:%d", idCalls, nameCalls)
+	}
+	if store.Len() != 0 {
+		t.Errorf("store = %+v", store.List())
+	}
+	if len(notifier.blockEvents()) != 0 {
+		t.Errorf("block events = %d", len(notifier.blockEvents()))
+	}
+}
+
+func TestFailsafeFailureIsReportedAndRetryable(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	fp.nodes = []panel.Node{{ID: 1, Name: "node-a", Status: "connected"}}
+	fp.reconnectErr = errors.New("node agent unavailable")
+	cfg := testConfig()
+	cfg.BlockDuration = 120
+	cfg.Failsafe = config.FailsafeConfig{Enabled: true, AfterMinutes: 20, CooldownMinutes: 60}
+	manager, notifier, store := newTestManager(t, cfg, fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(20 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, "failed failsafe event", func() bool {
+		return len(notifier.failsafeEvents()) == 1
+	})
+	record := mustBlock(t, store, "id:7")
+	if record.FailsafeTriggered {
+		t.Error("failed failsafe must not mark the block as triggered")
+	}
+	events := notifier.failsafeEvents()
+	if events[0].cause == nil || len(events[0].failed) != 1 {
+		t.Errorf("failsafe event = %+v", events[0])
+	}
+
+	// After the cooldown, another detection retries and succeeds.
+	fp.mu.Lock()
+	fp.reconnectErr = nil
+	fp.mu.Unlock()
+	clock.Advance(60 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, "retried failsafe", func() bool {
+		return len(fp.reconnected()) == 1 && len(notifier.failsafeEvents()) == 2
+	})
+	if record := mustBlock(t, store, "id:7"); !record.FailsafeTriggered {
+		t.Error("successful retry did not mark the block")
 	}
 }

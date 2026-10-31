@@ -124,6 +124,43 @@ func (d *Dispatcher) Failure(event Event, action string, cause error, attempt in
 	go d.sendTelegram(d.cfg.AdminBotToken, d.cfg.AdminChatID, text, event)
 }
 
+// Failsafe reports the result of the optional all-node reconnect. It is
+// admin-only: the end user does not need to know that the core was restarted.
+func (d *Dispatcher) Failsafe(event Event, reconnected, failed []string, cause error) {
+	if !d.cfg.SendAdminMessage {
+		return
+	}
+	username := event.Username
+	if username == "" {
+		username = fmt.Sprintf("user-%d", event.UserID)
+	}
+	status := "completed"
+	if cause != nil {
+		status = "FAILED"
+	}
+	lines := []string{
+		fmt.Sprintf("<b>tblocker: failsafe reconnect %s</b>", html.EscapeString(status)),
+		fmt.Sprintf("User: <code>%s</code>", html.EscapeString(username)),
+		fmt.Sprintf("ID: %d", event.UserID),
+		fmt.Sprintf("Nodes reconnected: %s", html.EscapeString(nodeList(reconnected))),
+	}
+	if len(failed) > 0 {
+		lines = append(lines, fmt.Sprintf("Nodes failed: %s", html.EscapeString(nodeList(failed))))
+	}
+	if cause != nil {
+		lines = append(lines, fmt.Sprintf("Error: <code>%s</code>", html.EscapeString(shorten(cause.Error(), 500))))
+	}
+	text := strings.Join(lines, "\n")
+	go d.sendTelegram(d.cfg.AdminBotToken, d.cfg.AdminChatID, text, event)
+}
+
+func nodeList(nodes []string) string {
+	if len(nodes) == 0 {
+		return "none"
+	}
+	return strings.Join(nodes, ", ")
+}
+
 func shorten(value string, max int) string {
 	if len(value) <= max {
 		return value
