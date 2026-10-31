@@ -1,6 +1,6 @@
 build/
 dist/
-tblocker-v*/
+releases/
 *.test
 *.out
 config.yaml
