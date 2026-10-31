@@ -57,6 +57,10 @@ type Manager struct {
 	// touchLogged rate-limits the "extended block" info line so a busy
 	// torrent does not flood journald.
 	touchLogged map[string]time.Time
+
+	// detectionTimes holds the recent torrent-tagged line timestamps per
+	// identity for the DetectionThreshold sliding window.
+	detectionTimes map[string][]time.Time
 }
 
 type cacheEntry struct {
@@ -88,14 +92,15 @@ func WithLogger(logger *log.Logger) Option {
 // New creates a Manager.
 func New(cfg *config.Config, store *storage.Store, panelClient Panel, notifier Notifier, opts ...Option) *Manager {
 	m := &Manager{
-		cfg:           cfg,
-		store:         store,
-		panel:         panelClient,
-		notifier:      notifier,
-		now:           time.Now,
-		logger:        log.New(log.Writer(), "blocker: ", log.LstdFlags),
-		identityCache: make(map[string]cacheEntry),
-		touchLogged:   make(map[string]time.Time),
+		cfg:            cfg,
+		store:          store,
+		panel:          panelClient,
+		notifier:       notifier,
+		now:            time.Now,
+		logger:         log.New(log.Writer(), "blocker: ", log.LstdFlags),
+		identityCache:  make(map[string]cacheEntry),
+		touchLogged:    make(map[string]time.Time),
+		detectionTimes: make(map[string][]time.Time),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -131,6 +136,19 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 				delete(m.identityCache, cacheKey)
 			}
 		}
+	}
+
+	// A missed cache entry (for example a username-keyed unresolved record)
+	// must not make an active block wait for the threshold again.
+	if record, found := m.findRecordForIdentity(det.Identity); found && record.State == storage.StateActive && now.Before(record.BlockedUntil) {
+		if updated, extended := m.extendBlockLocked(record, det, now, duration); extended {
+			m.logExtended(updated, now)
+			return nil
+		}
+	}
+
+	if !m.allowDetectionLocked(det, now) {
+		return nil
 	}
 
 	user, err := m.resolve(ctx, det.Identity)
@@ -406,6 +424,10 @@ func (m *Manager) ProcessExpired(ctx context.Context) {
 			m.logf("could not flush extended blocks: %v", err)
 		}
 	}()
+
+	m.mu.Lock()
+	m.pruneDetectionWindowLocked(m.now())
+	m.mu.Unlock()
 
 	// Snapshot keys first; each record is re-read under the lock so a block
 	// created while this loop runs is never lifted accidentally.
@@ -775,6 +797,84 @@ func (m *Manager) forgetBlockLocked(record storage.Block) {
 		}
 	}
 	delete(m.touchLogged, record.Key)
+}
+
+// findRecordForIdentity looks up an active/pending record using the same key
+// as the duplicate cache, without calling the panel.
+func (m *Manager) findRecordForIdentity(identity string) (storage.Block, bool) {
+	key := m.detectionCacheKey(identity)
+	if key == "" {
+		return storage.Block{}, false
+	}
+	return m.store.Get(key)
+}
+
+// allowDetectionLocked implements the per-identity detection threshold. It
+// returns false while fewer than DetectionThreshold torrent-tagged lines have
+// arrived inside the sliding window. The count is cleared when the threshold
+// is reached, so a failed/aborted block attempt starts a fresh burst.
+func (m *Manager) allowDetectionLocked(det logwatch.Detection, now time.Time) bool {
+	threshold := m.cfg.DetectionThreshold
+	if threshold <= 1 {
+		return true
+	}
+	window := time.Duration(m.cfg.DetectionWindowMinutes) * time.Minute
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+
+	key := m.detectionCacheKey(det.Identity)
+	if key == "" {
+		key = "identity:" + strings.TrimSpace(det.Identity)
+	}
+	if m.detectionTimes == nil {
+		m.detectionTimes = make(map[string][]time.Time)
+	}
+	times := m.detectionTimes[key]
+	cutoff := now.Add(-window)
+	first := 0
+	for first < len(times) && !times[first].After(cutoff) {
+		first++
+	}
+	times = times[first:]
+	times = append(times, now)
+
+	if len(times) < threshold {
+		m.detectionTimes[key] = times
+		return false
+	}
+	delete(m.detectionTimes, key)
+	m.logf("detection threshold reached for %s: %d torrent-tagged lines within %s",
+		det.Identity, len(times), window)
+	return true
+}
+
+// pruneDetectionWindowLocked drops stale per-identity counters. Called by the
+// expiry worker so a user who never reaches the threshold does not leave
+// timestamps in memory forever.
+func (m *Manager) pruneDetectionWindowLocked(now time.Time) {
+	threshold := m.cfg.DetectionThreshold
+	if threshold <= 1 {
+		return
+	}
+	window := time.Duration(m.cfg.DetectionWindowMinutes) * time.Minute
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	cutoff := now.Add(-window)
+	for key, times := range m.detectionTimes {
+		first := 0
+		for first < len(times) && !times[first].After(cutoff) {
+			first++
+		}
+		if first == len(times) {
+			delete(m.detectionTimes, key)
+			continue
+		}
+		if first > 0 {
+			m.detectionTimes[key] = times[first:]
+		}
+	}
 }
 
 func (m *Manager) detectionCacheKey(identity string) string {

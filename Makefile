@@ -1,5 +1,5 @@
 BINARY  := tblocker
-VERSION ?= v0.3.1-pg.7
+VERSION ?= v0.3.1-pg.8
 LDFLAGS := -s -w -X main.Version=$(VERSION)
 GOFLAGS := -trimpath
 

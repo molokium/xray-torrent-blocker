@@ -438,3 +438,34 @@ func TestLegacyDefaultRegexMigrated(t *testing.T) {
 		t.Errorf("missing migration warning: %v", warnings)
 	}
 }
+
+func TestDetectionToleranceDefaults(t *testing.T) {
+	cfg, _, err := Load(writeConfig(t, minimalConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DetectionThreshold != DefaultDetectionThreshold {
+		t.Errorf("DetectionThreshold = %d, want %d", cfg.DetectionThreshold, DefaultDetectionThreshold)
+	}
+	if cfg.DetectionWindowMinutes != DefaultDetectionWindowMinutes {
+		t.Errorf("DetectionWindowMinutes = %d, want %d", cfg.DetectionWindowMinutes, DefaultDetectionWindowMinutes)
+	}
+}
+
+func TestDetectionToleranceConfigured(t *testing.T) {
+	body := minimalConfig + "DetectionThreshold: 10\nDetectionWindowMinutes: 5\n"
+	cfg, _, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DetectionThreshold != 10 || cfg.DetectionWindowMinutes != 5 {
+		t.Errorf("tolerance = %d/%d", cfg.DetectionThreshold, cfg.DetectionWindowMinutes)
+	}
+}
+
+func TestDetectionToleranceValidation(t *testing.T) {
+	body := minimalConfig + "DetectionThreshold: 1001\nDetectionWindowMinutes: 1441\n"
+	if _, _, err := Load(writeConfig(t, body)); err == nil {
+		t.Fatal("expected validation error")
+	}
+}

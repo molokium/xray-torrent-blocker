@@ -1,6 +1,6 @@
 # PasarGuard Torrent Blocker
 
-Current build: **v0.3.1-pg.7**
+Current build: **v0.3.1-pg.8**
 
 A fork of [kutovoys/xray-torrent-blocker](https://github.com/kutovoys/xray-torrent-blocker)
 based on **v0.3.1**, the last release with Telegram support, reworked to block
@@ -34,18 +34,21 @@ For every access-log line containing `TorrentTag`:
 
 1. Extract the `email:` value. PasarGuard writes the numeric panel user ID there
    (`email: 42`), so the default regex captures that ID.
-2. Resolve the user with `GET /api/user/by-id/42` (or by username, see
+2. Count torrent-tagged lines per identity. If fewer than `DetectionThreshold`
+   arrived in the last `DetectionWindowMinutes`, do nothing. The default
+   threshold is `1`, which preserves immediate blocking.
+3. Resolve the user with `GET /api/user/by-id/42` (or by username, see
    `Identifier`).
-3. If the account is already disabled, journal a block record and notify the
+4. If the account is already disabled, journal a block record and notify the
    administrator. It is never enabled by tblocker later.
-4. Otherwise journal a **pending** record, call
+5. Otherwise journal a **pending** record, call
    `PUT /api/user/by-id/42/disabled` with `{"disabled":true}`, verify the
    response says `disabled`, and mark the record **active**.
-5. Notify Telegram/webhook.
-6. Every new torrent line for an active block moves `BlockedUntil` to
+6. Notify Telegram/webhook.
+7. Every new torrent line for an active block moves `BlockedUntil` to
    `now + BlockDuration`. Duplicate lines do not call the panel again; the
    journal update is coalesced and flushed about once per second.
-7. An expiry worker runs every `CheckIntervalSeconds` (default 15). When
+8. An expiry worker runs every `CheckIntervalSeconds` (default 15). When
    `BlockedUntil` passes it reads the user again and, if the account is still
    disabled, sends `{"disabled":false}`. The panel then restores the correct
    status (`active`, `limited`, `expired`, or `on_hold`).
@@ -59,6 +62,28 @@ account.
 `BlockDuration` is expressed in whole minutes (minimum 1). For a short expiry
 test use `BlockDuration: 1` and `CheckIntervalSeconds: 5`; the sliding logic
 works at whatever duration is configured.
+
+### Detection tolerance
+
+Real torrent traffic normally produces many access-log lines; false positives
+usually produce only a handful. Set a threshold to ignore isolated detections:
+
+```yaml
+DetectionThreshold: 10
+DetectionWindowMinutes: 5
+```
+
+The first 9 torrent-tagged lines for an identity in the last 5 minutes do
+nothing. The 10th line triggers the normal block path. The counter then resets.
+An **already active block is exempt**: any new line extends its sliding timer,
+so a real torrent still keeps the ban alive. The default threshold is `1`
+(block on the first line); existing configs without the keys keep the old
+behavior. The example configuration ships with `10`/`5`.
+
+Counters are in memory and pruned by the expiry worker; they are not persisted,
+so a restart starts a fresh detection burst. That is intentional: the journal
+still remembers active blocks, while the tolerance only decides whether a new
+block should start.
 
 The journal is written before the API call. If the process dies or the panel
 times out mid-request, the pending record is reconciled on the next tick: if the
@@ -253,6 +278,8 @@ The full annotated file is [`config.yaml.example`](config.yaml.example).
 | `LogFile` | required | Xray access log to follow |
 | `BlockDuration` | required | idle ban length in minutes; resets on each new detection (> 0) |
 | `TorrentTag` | `TORRENT` | substring that marks a torrent line |
+| `DetectionThreshold` | `1` | torrent lines required before a block (1 = immediate) |
+| `DetectionWindowMinutes` | `5` | sliding window for the threshold |
 | `StorageDir` | `/opt/tblocker` | directory for `blocks.json` |
 | `Hostname` | system hostname | name in admin notifications |
 | `CheckIntervalSeconds` | `15` | expiry worker interval (5–3600) |
@@ -501,6 +528,9 @@ run one instance per `StorageDir`, and sign or checksum the binary you deploy.
   PasarGuard user. Do not use the `IgnoreEmail` option from upstream v1.x.
 - Blocking is per account, not per IP. A user with several devices loses all of
   them, which is normally the intent.
+- Detection-tolerance counters are in memory. A restart starts a fresh burst, and
+  a false-positive rate at or above `DetectionThreshold` still blocks; tune the
+  threshold above the noise you actually see.
 - The panel API does not report who changed a user's status. If an
   administrator disables a user during a tblocker block, the expiry worker may
   enable them again. Set `ReenableOnUnblock: false` if that race matters.

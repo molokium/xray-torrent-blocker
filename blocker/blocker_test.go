@@ -1277,3 +1277,111 @@ func TestUnresolvedPendingSurvivesRestart(t *testing.T) {
 		t.Errorf("block events = %d", len(notifier.blockEvents()))
 	}
 }
+
+func TestDetectionThresholdRequiresBurst(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	cfg := testConfig()
+	cfg.DetectionThreshold = 10
+	cfg.DetectionWindowMinutes = 5
+	manager, notifier, store := newTestManager(t, cfg, fp, clock)
+
+	for i := 0; i < 9; i++ {
+		if err := manager.Handle(context.Background(), testDetection("7", "203.0.113.9", "")); err != nil {
+			t.Fatalf("Handle %d: %v", i, err)
+		}
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Fatalf("panel was called before the threshold: %+v", calls)
+	}
+	if idCalls, nameCalls := fp.counts(); idCalls != 0 || nameCalls != 0 {
+		t.Fatalf("panel was queried before the threshold: id=%d name=%d", idCalls, nameCalls)
+	}
+	if store.Len() != 0 {
+		t.Fatalf("record created before the threshold: %+v", store.List())
+	}
+
+	if err := manager.Handle(context.Background(), testDetection("7", "203.0.113.9", "")); err != nil {
+		t.Fatalf("threshold Handle: %v", err)
+	}
+	if calls := fp.calls(); len(calls) != 1 || !calls[0].Disabled {
+		t.Fatalf("calls after threshold = %+v", calls)
+	}
+	if block := mustBlock(t, store, "id:7"); block.State != storage.StateActive {
+		t.Errorf("block = %+v", block)
+	}
+	if len(notifier.blockEvents()) != 1 {
+		t.Errorf("block events = %d", len(notifier.blockEvents()))
+	}
+}
+
+func TestDetectionWindowExpiresOldLines(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	cfg := testConfig()
+	cfg.DetectionThreshold = 10
+	cfg.DetectionWindowMinutes = 5
+	manager, _, store := newTestManager(t, cfg, fp, clock)
+
+	for i := 0; i < 9; i++ {
+		if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clock.Advance(6 * time.Minute)
+
+	for i := 0; i < 9; i++ {
+		if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Fatalf("panel called with 9 fresh lines: %+v", calls)
+	}
+	if store.Len() != 0 {
+		t.Fatalf("record created with 9 fresh lines: %+v", store.List())
+	}
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fp.calls(); len(calls) != 1 {
+		t.Fatalf("calls after 10 fresh lines = %+v", calls)
+	}
+}
+
+func TestActiveBlockBypassesDetectionThreshold(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	cfg := testConfig()
+	cfg.DetectionThreshold = 10
+	cfg.DetectionWindowMinutes = 5
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(storage.Block{
+		Key:          "id:7",
+		UserID:       7,
+		Username:     "alice",
+		BlockedAt:    clock.Now(),
+		BlockedUntil: clock.Now().Add(10 * time.Minute),
+		State:        storage.StateActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &fakeNotifier{}
+	manager := New(cfg, store, fp, notifier, WithClock(clock.Now), WithLogger(log.New(io.Discard, "", 0)))
+	clock.Advance(time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	block := mustBlock(t, store, "id:7")
+	if want := clock.Now().Add(10 * time.Minute); !block.BlockedUntil.Equal(want) {
+		t.Errorf("expiry = %s, want %s", block.BlockedUntil, want)
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Errorf("panel called for an active block: %+v", calls)
+	}
+}

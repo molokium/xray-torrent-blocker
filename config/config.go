@@ -21,6 +21,12 @@ const (
 	DefaultTelegramAPIURL   = "https://api.telegram.org"
 	DefaultTimeoutSeconds   = 10
 	DefaultCheckIntervalSec = 15
+	// DefaultDetectionThreshold preserves the historical immediate-block
+	// behaviour. Set it to a higher value (for example 10) to require a burst
+	// of torrent-tagged lines before blocking.
+	DefaultDetectionThreshold = 1
+	// DefaultDetectionWindowMinutes is the sliding window for the threshold.
+	DefaultDetectionWindowMinutes = 5
 )
 
 const (
@@ -92,12 +98,18 @@ func (p PasarGuardConfig) StartupCheckEnabled() bool {
 
 // Config is the validated runtime configuration.
 type Config struct {
-	LogFile              string `yaml:"LogFile"`
-	BlockDuration        int    `yaml:"BlockDuration"`
-	TorrentTag           string `yaml:"TorrentTag"`
-	StorageDir           string `yaml:"StorageDir"`
-	Hostname             string `yaml:"Hostname"`
-	CheckIntervalSeconds int    `yaml:"CheckIntervalSeconds"`
+	LogFile       string `yaml:"LogFile"`
+	BlockDuration int    `yaml:"BlockDuration"`
+	TorrentTag    string `yaml:"TorrentTag"`
+	// DetectionThreshold is the number of torrent-tagged lines required
+	// within DetectionWindowMinutes before a block is applied. 1 disables
+	// the tolerance and blocks on the first line.
+	DetectionThreshold int `yaml:"DetectionThreshold"`
+	// DetectionWindowMinutes is the sliding window for DetectionThreshold.
+	DetectionWindowMinutes int    `yaml:"DetectionWindowMinutes"`
+	StorageDir             string `yaml:"StorageDir"`
+	Hostname               string `yaml:"Hostname"`
+	CheckIntervalSeconds   int    `yaml:"CheckIntervalSeconds"`
 	// UsePolling switches the log follower from inotify to stat polling.
 	// Polling is slower but works on filesystems with unreliable inotify.
 	UsePolling bool `yaml:"UsePolling"`
@@ -229,6 +241,12 @@ func applyDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.TorrentTag) == "" {
 		cfg.TorrentTag = DefaultTorrentTag
 	}
+	if cfg.DetectionThreshold <= 0 {
+		cfg.DetectionThreshold = DefaultDetectionThreshold
+	}
+	if cfg.DetectionWindowMinutes <= 0 {
+		cfg.DetectionWindowMinutes = DefaultDetectionWindowMinutes
+	}
 	if strings.TrimSpace(cfg.StorageDir) == "" {
 		cfg.StorageDir = DefaultStorageDir
 	}
@@ -295,6 +313,12 @@ func validate(cfg *Config) error {
 	}
 	if strings.TrimSpace(cfg.TorrentTag) == "" {
 		errs = append(errs, errors.New("TorrentTag must not be empty"))
+	}
+	if cfg.DetectionThreshold < 1 || cfg.DetectionThreshold > 1000 {
+		errs = append(errs, errors.New("DetectionThreshold must be between 1 and 1000"))
+	}
+	if cfg.DetectionWindowMinutes < 1 || cfg.DetectionWindowMinutes > 1440 {
+		errs = append(errs, errors.New("DetectionWindowMinutes must be between 1 and 1440"))
 	}
 	if cfg.CheckIntervalSeconds < 5 || cfg.CheckIntervalSeconds > 3600 {
 		errs = append(errs, errors.New("CheckIntervalSeconds must be between 5 and 3600"))

@@ -1,6 +1,6 @@
 # QA record
 
-Version: `v0.3.1-pg.7` (fork of xray-torrent-blocker v0.3.1)
+Version: `v0.3.1-pg.8` (fork of xray-torrent-blocker v0.3.1)
 
 ## Environment
 
@@ -15,8 +15,8 @@ Version: `v0.3.1-pg.7` (fork of xray-torrent-blocker v0.3.1)
 ```text
 $ go test -race -shuffle=on -cover ./...
 ok  tblocker            1.040s  coverage: 10.6% of statements
-ok  tblocker/blocker    1.165s  coverage: 73.5% of statements
-ok  tblocker/config     1.050s  coverage: 92.5% of statements
+ok  tblocker/blocker    1.206s  coverage: 72.4% of statements
+ok  tblocker/config     1.066s  coverage: 92.8% of statements
 ok  tblocker/logwatch   7.189s  coverage: 86.2% of statements
 ok  tblocker/notify     1.343s  coverage: 82.4% of statements
 ok  tblocker/panel      1.543s  coverage: 78.9% of statements
@@ -54,6 +54,31 @@ The security review in `README.md` is backed by these tests:
 | `TestBlockFailureNotifiesAdmin` | block transport failure sends an admin alert |
 | `TestUnblockFailureNotifiesAdmin` | unblock transport failure sends an admin alert |
 | `TestTelegramFailureSendsAdmin` | failure alert includes action, user, error, attempt, retry |
+| `TestDetectionThresholdRequiresBurst` | 9 lines do nothing; the 10th blocks |
+| `TestDetectionWindowExpiresOldLines` | old lines outside the window are discarded |
+| `TestActiveBlockBypassesDetectionThreshold` | an active block still slides on a single line |
+| `TestDetectionToleranceDefaults` | absent keys preserve immediate blocking |
+| `TestDetectionToleranceConfigured` | explicit threshold/window are loaded |
+| `TestDetectionToleranceValidation` | out-of-range tolerance is rejected |
+
+## Detection tolerance (pg.8)
+
+`DetectionThreshold` and `DetectionWindowMinutes` implement a per-identity
+sliding count. With `10`/`5`, the first nine torrent-tagged lines in five
+minutes do nothing; the tenth enters the normal resolve/block path. The counter
+is cleared when it fires.
+
+- An already active block is checked before the threshold and is extended by
+  every new line, so a threshold does not stop the sliding ban timer.
+- Defaults are `1` and `5`; an existing config without the keys keeps immediate
+  blocking. `config.yaml.example` ships `10`/`5`.
+- Counters are in memory and pruned by the expiry worker; they are not in
+  `blocks.json`. A restart starts a fresh burst, while active blocks remain in
+  the journal.
+- `TestDetectionThresholdRequiresBurst`, `TestDetectionWindowExpiresOldLines`,
+  and `TestActiveBlockBypassesDetectionThreshold` cover the behavior;
+  `TestDetectionToleranceDefaults`, `TestDetectionToleranceConfigured`, and
+  `TestDetectionToleranceValidation` cover config loading.
 
 ## Performance and later-version ports
 
@@ -110,9 +135,10 @@ avg_parse=0s goroutines=4 heap_mb=1 gc=0 uptime=2s
 
 ## Black-box binary test (fake PasarGuard)
 
-`python3 qa/e2e.py` passed on `v0.3.1-pg.7` after the parser, queue,
-inotify/polling, complete-line, security, non-root, and sliding-expiry changes. It starts the
-real binary as the unprivileged current user and verifies:
+`python3 qa/e2e.py` passed on `v0.3.1-pg.8` after the parser, queue,
+inotify/polling, complete-line, security, non-root, sliding-expiry, and
+detection-tolerance changes. It starts the real binary as the unprivileged
+current user and verifies:
 
 - `PUT /api/user/by-id/42/disabled` with `{"disabled":true}`
 - `X-Api-Key` header
@@ -131,8 +157,11 @@ real binary as the unprivileged current user and verifies:
 
 `python3 qa/live_panel.py` against PasarGuard v5.5.1 passed on
 `v0.3.1-pg.4` after the parser and hardening changes. pg.5 changed the service
-unit/installer, and pg.6 adds sliding expiry; the panel request contract is
-unchanged, and the pg.6 black-box E2E covers the extended timer. It verified:
+unit/installer, pg.6 added sliding expiry, pg.7 added retries/failure alerts,
+and pg.8 added detection tolerance; the panel request contract is unchanged.
+The pg.8 E2E uses `DetectionThreshold: 10` and covers the threshold, active-block
+bypass, normal blocking, expiry, and the sliding timer; retry/restart edge cases
+are covered by unit tests. It verified:
 
 - numeric ID (`email: 1`, `Identifier: auto`)
 - username mode (`Identifier: username`)

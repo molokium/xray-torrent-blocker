@@ -17,6 +17,12 @@ BlockDuration: 10
 # routing rule's outboundTag in the Xray configuration.
 TorrentTag: "TORRENT"
 
+# Detection tolerance: require this many torrent-tagged lines within the
+# sliding window before blocking. 1 = block on the first line. Set this to a
+# higher value to ignore isolated false positives.
+DetectionThreshold: 10
+DetectionWindowMinutes: 5
+
 # Directory for blocks.json, the durable block journal. Keep it on persistent
 # storage: it is what lets the service re-enable users after a restart. It must
 # be writable by the tblocker service user (0750, owned tblocker:tblocker).

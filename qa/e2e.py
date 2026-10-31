@@ -156,6 +156,8 @@ def write_config(path: Path, base_url: str, storage: Path, logfile: Path) -> Non
         f"""LogFile: "{logfile}"
 BlockDuration: 10
 TorrentTag: "TORRENT"
+DetectionThreshold: 10
+DetectionWindowMinutes: 5
 StorageDir: "{storage}"
 Hostname: "e2e-node"
 CheckIntervalSeconds: 5
@@ -258,7 +260,10 @@ def main() -> int:
         # --- 1. block an active user -------------------------------------
         runner = Runner(config)
         time.sleep(0.8)
-        append_line(logfile)
+        # Detection tolerance: the first nine lines must not block; the tenth
+        # crosses the configured threshold.
+        for _ in range(10):
+            append_line(logfile)
 
         wait_for(lambda: len(STATE.disable_calls) == 1, "disable call")
         call = STATE.disable_calls[0]
@@ -319,7 +324,8 @@ def main() -> int:
             STATE.webhooks.clear()
         runner = Runner(config)
         time.sleep(0.8)
-        append_line(logfile)
+        for _ in range(10):
+            append_line(logfile)
         wait_for(lambda: len(STATE.telegram) == 2, "pre-existing block notification")
         assert len(STATE.disable_calls) == 0, STATE.disable_calls
         blocks = json.loads((storage / "blocks.json").read_text())
