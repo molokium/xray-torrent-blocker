@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -280,6 +281,21 @@ def main() -> int:
         record = next(iter(blocks.values()))
         assert record["state"] == "active", record
         assert record["previous_status"] == "active", record
+
+        # A second torrent line must slide the expiry forward without another
+        # panel call or notification.
+        first_until = datetime.fromisoformat(record["blocked_until"])
+        append_line(logfile)
+
+        def extended() -> bool:
+            data = json.loads((storage / "blocks.json").read_text())
+            current = next(iter(data.values()))
+            return datetime.fromisoformat(current["blocked_until"]) > first_until
+
+        wait_for(extended, "journal expiry extension")
+        assert len(STATE.disable_calls) == 1, STATE.disable_calls
+        assert len(STATE.telegram) == 2, STATE.telegram
+        assert len(STATE.webhooks) == 1, STATE.webhooks
 
         runner.stop()
         assert runner.proc.returncode in (0, -signal.SIGTERM), runner.proc.returncode

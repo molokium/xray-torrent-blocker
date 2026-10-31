@@ -3,6 +3,7 @@ package notify
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -311,5 +312,37 @@ func TestWebhookDoesNotFollowRedirect(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "HTTP 302") {
 		t.Errorf("log = %q", buf.String())
+	}
+}
+
+func TestTelegramFailureSendsAdmin(t *testing.T) {
+	requests := make(chan telegramRequest, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		requests <- telegramRequest{path: r.URL.Path, form: r.PostForm}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.TelegramAPIURL = server.URL
+	cfg.SendUserMessage = false
+	dispatcher := New(cfg)
+
+	dispatcher.Failure(Event{Username: "alice", UserID: 42}, "block", errors.New("network down"), 2, 30*time.Second)
+
+	select {
+	case req := <-requests:
+		if got := first(req.form["chat_id"]); got != "999" {
+			t.Errorf("chat_id = %q", got)
+		}
+		text := first(req.form["text"])
+		for _, want := range []string{"block failed", "alice", "network down", "Attempt: 2", "30s"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("text %q missing %q", text, want)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for failure notification")
 	}
 }

@@ -1,6 +1,6 @@
 # QA record
 
-Version: `v0.3.1-pg.5` (fork of xray-torrent-blocker v0.3.1)
+Version: `v0.3.1-pg.7` (fork of xray-torrent-blocker v0.3.1)
 
 ## Environment
 
@@ -15,12 +15,12 @@ Version: `v0.3.1-pg.5` (fork of xray-torrent-blocker v0.3.1)
 ```text
 $ go test -race -shuffle=on -cover ./...
 ok  tblocker            1.040s  coverage: 10.6% of statements
-ok  tblocker/blocker    1.122s  coverage: 78.9% of statements
+ok  tblocker/blocker    1.165s  coverage: 73.5% of statements
 ok  tblocker/config     1.050s  coverage: 92.5% of statements
 ok  tblocker/logwatch   7.189s  coverage: 86.2% of statements
-ok  tblocker/notify     1.329s  coverage: 83.1% of statements
+ok  tblocker/notify     1.343s  coverage: 82.4% of statements
 ok  tblocker/panel      1.543s  coverage: 78.9% of statements
-ok  tblocker/storage    1.149s  coverage: 79.8% of statements
+ok  tblocker/storage    1.111s  coverage: 82.1% of statements
 ```
 
 `go vet ./...` is clean. `gofmt -l .` is empty. `shellcheck install.sh` and
@@ -41,6 +41,19 @@ The security review in `README.md` is backed by these tests:
 | `TestConfigPermissionWarning` | a group/world-readable config containing a real key is reported |
 | `TestEmbeddedCredentialsRejected` | `user:pass@host` panel URLs are rejected |
 | `TestLegacyDefaultRegexMigrated` | the old unanchored default is replaced on startup |
+| `TestHandleDuplicateDetectionExtendsBlock` | a second torrent line moves an active block's expiry forward without a panel call |
+| `TestHandleAlreadyDisabledExtendsBlock` | a pre-existing-disabled record also slides, but is never enabled |
+| `TestExtendAndFlushPersists` | coalesced extension is durable after Flush/reopen |
+| `TestExtendIgnoresPendingAndMissing` | pending/missing records are not extended |
+| `TestRestartAfterExpiryUnblocks` | restart after the expiry still enables the account |
+| `TestUnresolvedPendingSurvivesRestart` | a failed panel lookup is durable and retried after restart |
+| `TestResolveFailurePersistsPendingAndRetries` | a resolve network failure is retried and eventually disables |
+| `TestResolveFailureThenDisabledUserIsPreExisting` | an unresolved user found disabled is never enabled |
+| `TestPendingReconcileRetriesDisable` | an unapplied disable is retried, not dropped |
+| `TestPendingReconcileExpiredActiveDropsWithoutLateDisable` | an expired pending block is not applied late |
+| `TestBlockFailureNotifiesAdmin` | block transport failure sends an admin alert |
+| `TestUnblockFailureNotifiesAdmin` | unblock transport failure sends an admin alert |
+| `TestTelegramFailureSendsAdmin` | failure alert includes action, user, error, attempt, retry |
 
 ## Performance and later-version ports
 
@@ -97,8 +110,8 @@ avg_parse=0s goroutines=4 heap_mb=1 gc=0 uptime=2s
 
 ## Black-box binary test (fake PasarGuard)
 
-`python3 qa/e2e.py` passed on `v0.3.1-pg.5` after the parser, queue,
-inotify/polling, complete-line, security, and non-root changes. It starts the
+`python3 qa/e2e.py` passed on `v0.3.1-pg.7` after the parser, queue,
+inotify/polling, complete-line, security, non-root, and sliding-expiry changes. It starts the
 real binary as the unprivileged current user and verifies:
 
 - `PUT /api/user/by-id/42/disabled` with `{"disabled":true}`
@@ -106,6 +119,8 @@ real binary as the unprivileged current user and verifies:
 - Telegram admin + user messages
 - webhook `block`
 - journal `state=active`, `previous_status=active`
+- a second torrent line moves `blocked_until` forward without another panel
+  call or notification
 - restart with a future expiry does not enable the user
 - restart with an expired journal record calls `disabled:false` and clears the
   journal
@@ -115,8 +130,9 @@ real binary as the unprivileged current user and verifies:
 ## Live PasarGuard test
 
 `python3 qa/live_panel.py` against PasarGuard v5.5.1 passed on
-`v0.3.1-pg.4` after the parser and hardening changes; pg.5 changes only the
-service unit and installer, so the runtime path is identical. It verified:
+`v0.3.1-pg.4` after the parser and hardening changes. pg.5 changed the service
+unit/installer, and pg.6 adds sliding expiry; the panel request contract is
+unchanged, and the pg.6 black-box E2E covers the extended timer. It verified:
 
 - numeric ID (`email: 1`, `Identifier: auto`)
 - username mode (`Identifier: username`)
@@ -252,13 +268,56 @@ because creating a system user requires interactive root authentication, so
 `install.sh` is covered by `shellcheck`/`bash -n` and the unit by
 `systemd-analyze`.
 
+## Sliding expiry (pg.6)
+
+`BlockDuration` is an idle timeout. Every torrent line for an active block calls
+`Store.Extend` with `now + BlockDuration`; no panel call is made. The journal
+update is coalesced and flushed by a 1-second ticker in `Manager.Run`, by the
+expiry worker, and on shutdown. A crash can lose at most about one second of
+the most recent extension; the in-memory timer always uses the latest
+detection, so a running service does not unblock between flushes.
+
+The same path extends a `pre_existing_disabled` record. That record still only
+removes itself at expiry; it never sends `disabled:false`.
+
+Unit coverage: `TestHandleDuplicateDetectionExtendsBlock`,
+`TestHandleAlreadyDisabledExtendsBlock`, `TestExtendAndFlushPersists`,
+`TestExtendIgnoresPendingAndMissing`.
+
+## Restart and failure recovery (pg.7)
+
+- `Manager.Run` calls `ProcessExpired` immediately at startup. An active record
+  past `BlockedUntil` is enabled at that point, even if the service was down
+  across the expiry.
+- `TestRestartAfterExpiryUnblocks` covers the “crashed at 03:50, restarted at
+  04:30” case: the second `ProcessExpired` calls `disabled:false`, removes the
+  record, and emits an unblock notification.
+- Pending blocks are reconciled at startup: disabled becomes active; active
+  with the window remaining is retried; active with the window elapsed is
+  dropped rather than disabled late.
+- A failed initial resolve writes a durable pending record keyed by the numeric
+  ID or username (`unresolved=true`) and retries. `TestUnresolvedPendingSurvivesRestart`
+  covers the restart path.
+- Retry backoff is 15s, 30s, 1m, 2m, 4m, 8m, then 10m; `attempts` and
+  `next_attempt` are stored in `blocks.json`.
+- Unblock failures keep the active record and retry the same way.
+- Definitive resolve/disable 4xx errors are not retried; the pending record is
+  removed and an admin alert is sent.
+
+Failure notifications are sent through the optional `FailureNotifier`
+interface implemented by `notify.Dispatcher`: they are admin-only, require
+`SendAdminMessage: true`, and include action, user, error, attempt, and retry
+delay. The end user is not notified. `TestTelegramFailureSendsAdmin` covers the
+message shape.
+
 ## Pending-record reconciliation
 
 Unit tests cover the ambiguous-failure path: a 500/timeout while disabling
-leaves a `pending` journal record; the next worker tick reads the user and either
-marks the block active (panel applied it) or drops the record (panel did not).
-A crash after the API call but before the journal update is handled the same way
-on restart.
+leaves a `pending` journal record; the next worker tick reads the user and
+either marks the block active (panel applied it), retries the disable (panel did
+not apply it and the window remains), or drops it (window elapsed). A crash
+after the API call but before the journal update is handled the same way on
+restart.
 
 ## Known limitations verified in review
 

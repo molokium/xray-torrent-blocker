@@ -39,6 +39,7 @@ type Block struct {
 	BlockedUntil        time.Time `json:"blocked_until"`
 	PreviousStatus      string    `json:"previous_status"`
 	PreExistingDisabled bool      `json:"pre_existing_disabled"`
+	Unresolved          bool      `json:"unresolved,omitempty"`
 	State               string    `json:"state"`
 	Notified            bool      `json:"notified"`
 	Attempts            int       `json:"unblock_attempts"`
@@ -51,6 +52,9 @@ type Store struct {
 	path   string
 	mu     sync.RWMutex
 	blocks map[string]Block
+	// dirty means Extend changed the in-memory state without an immediate
+	// fsync. A short flush interval coalesces bursts of duplicate detections.
+	dirty bool
 }
 
 // New opens (or creates) the store inside dir. A corrupt store is a hard
@@ -164,8 +168,10 @@ func (s *Store) Put(block Block) error {
 		} else {
 			delete(s.blocks, block.Key)
 		}
+		s.dirty = true
 		return err
 	}
+	s.dirty = false
 	return nil
 }
 
@@ -181,8 +187,56 @@ func (s *Store) Remove(key string) error {
 	delete(s.blocks, key)
 	if err := s.saveLocked(); err != nil {
 		s.blocks[key] = previous
+		s.dirty = true
 		return err
 	}
+	s.dirty = false
+	return nil
+}
+
+// Extend updates an active block's expiry and last-seen metadata without an
+// immediate fsync. The caller is responsible for periodic Flush calls. It
+// returns false if the key is unknown or the record is not active.
+func (s *Store) Extend(key string, until time.Time, ip, telegramID string) (Block, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	block, ok := s.blocks[key]
+	if !ok || block.State != StateActive {
+		return Block{}, false
+	}
+
+	changed := false
+	if until.After(block.BlockedUntil) {
+		block.BlockedUntil = until
+		changed = true
+	}
+	if ip != "" && ip != block.IP {
+		block.IP = ip
+		changed = true
+	}
+	if telegramID != "" && telegramID != block.TelegramID {
+		block.TelegramID = telegramID
+		changed = true
+	}
+	if changed {
+		s.blocks[key] = block
+		s.dirty = true
+	}
+	return block, true
+}
+
+// Flush persists pending in-memory extensions. It is a no-op when clean.
+func (s *Store) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty {
+		return nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	s.dirty = false
 	return nil
 }
 
@@ -257,5 +311,5 @@ func (s *Store) saveLocked() error {
 	return nil
 }
 
-// Close is a no-op kept for symmetry; every mutation is already durable.
-func (s *Store) Close() error { return nil }
+// Close flushes any coalesced extensions. Every Put/Remove is already durable.
+func (s *Store) Close() error { return s.Flush() }

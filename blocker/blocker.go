@@ -32,6 +32,12 @@ type Notifier interface {
 	Unblock(event notify.Event)
 }
 
+// FailureNotifier is optional. When implemented, transport failures and
+// irreversible API errors are reported to the administrator.
+type FailureNotifier interface {
+	Failure(event notify.Event, action string, cause error, attempt int, retry time.Duration)
+}
+
 // Manager owns the block lifecycle. All state transitions are serialised by mu
 // so that a log line and the expiry worker cannot race on the same account.
 type Manager struct {
@@ -47,6 +53,10 @@ type Manager struct {
 	// already blocked. It is keyed by "id:<n>" and "username:<name>" and is
 	// rebuilt from the journal at startup.
 	identityCache map[string]cacheEntry
+
+	// touchLogged rate-limits the "extended block" info line so a busy
+	// torrent does not flood journald.
+	touchLogged map[string]time.Time
 }
 
 type cacheEntry struct {
@@ -85,6 +95,7 @@ func New(cfg *config.Config, store *storage.Store, panelClient Panel, notifier N
 		now:           time.Now,
 		logger:        log.New(log.Writer(), "blocker: ", log.LstdFlags),
 		identityCache: make(map[string]cacheEntry),
+		touchLogged:   make(map[string]time.Time),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -104,62 +115,80 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 	duration := time.Duration(m.cfg.BlockDuration) * time.Minute
 
 	// A torrent client opens many connections. Once an account is blocked,
-	// skip repeats without asking the panel again.
+	// every new detection extends the timer by BlockDuration, but only the
+	// journal is touched: repeated lines do not call the panel again.
 	if cacheKey := m.detectionCacheKey(det.Identity); cacheKey != "" {
 		if entry, ok := m.identityCache[cacheKey]; ok {
 			if now.Before(entry.Until) {
-				m.logf("identity %s is already blocked until %s; skipping detection",
-					det.Identity, entry.Until.Format(time.RFC3339))
-				return nil
+				if record, found := m.store.Get(entry.Key); found && record.State == storage.StateActive {
+					if updated, extended := m.extendBlockLocked(record, det, now, duration); extended {
+						m.logExtended(updated, now)
+						return nil
+					}
+				}
+				delete(m.identityCache, cacheKey)
+			} else {
+				delete(m.identityCache, cacheKey)
 			}
-			delete(m.identityCache, cacheKey)
 		}
 	}
 
 	user, err := m.resolve(ctx, det.Identity)
 	if err != nil {
-		return fmt.Errorf("resolve user %q: %w", det.Identity, err)
+		return m.handleResolveFailure(ctx, det, now, duration, err)
 	}
 	key, err := userKey(user)
 	if err != nil {
 		return err
 	}
 
-	if existing, ok := m.store.Get(key); ok {
-		if now.Before(existing.BlockedUntil) {
-			m.logf("user %s (id %d) is already blocked until %s; skipping duplicate detection",
-				displayName(user), user.ID, existing.BlockedUntil.Format(time.RFC3339))
-			return nil
-		}
-
-		if user.Status == panel.StatusDisabled {
-			// The previous block expired but the account is still disabled,
-			// either because the unblock call failed or because an
-			// administrator disabled it. Re-arm without another API call.
-			existing.BlockedAt = now
-			existing.BlockedUntil = now.Add(duration)
-			existing.IP = det.IP
-			existing.State = storage.StateActive
-			existing.Notified = true
-			existing.Attempts = 0
-			existing.NextAttempt = time.Time{}
-			if det.TelegramID != "" {
-				existing.TelegramID = det.TelegramID
+	existing, existed := m.findRecordForUser(user)
+	if existed {
+		if existing.State == storage.StatePending {
+			if now.Before(existing.BlockedUntil) {
+				m.logf("user %s (id %d) has a pending block until %s; waiting for reconciliation",
+					displayName(user), user.ID, existing.BlockedUntil.Format(time.RFC3339))
+				return nil
 			}
-			if err := m.store.Put(existing); err != nil {
-				return fmt.Errorf("persist re-armed block for %s: %w", displayName(user), err)
-			}
-			m.rememberBlockLocked(existing)
-			m.notifyBlock(existing, user)
-			m.logf("re-armed block for user %s (id %d) until %s (already disabled in panel)",
-				displayName(user), user.ID, existing.BlockedUntil.Format(time.RFC3339))
+			m.reconcilePending(ctx, existing)
 			return nil
-		}
+		} else {
+			if now.Before(existing.BlockedUntil) {
+				if updated, extended := m.extendBlockLocked(existing, det, now, duration); extended {
+					m.logExtended(updated, now)
+					return nil
+				}
+			}
 
-		if err := m.store.Remove(key); err != nil {
-			return fmt.Errorf("remove expired block record for %s: %w", displayName(user), err)
+			if user.Status == panel.StatusDisabled {
+				// The previous block expired but the account is still disabled,
+				// either because the unblock call failed or because an
+				// administrator disabled it. Re-arm without another API call.
+				existing.BlockedAt = now
+				existing.BlockedUntil = now.Add(duration)
+				existing.IP = det.IP
+				existing.State = storage.StateActive
+				existing.Notified = true
+				existing.Attempts = 0
+				existing.NextAttempt = time.Time{}
+				if det.TelegramID != "" {
+					existing.TelegramID = det.TelegramID
+				}
+				if err := m.store.Put(existing); err != nil {
+					return fmt.Errorf("persist re-armed block for %s: %w", displayName(user), err)
+				}
+				m.rememberBlockLocked(existing)
+				m.notifyBlock(existing, user)
+				m.logf("re-armed block for user %s (id %d) until %s (already disabled in panel)",
+					displayName(user), user.ID, existing.BlockedUntil.Format(time.RFC3339))
+				return nil
+			}
+
+			if err := m.store.Remove(existing.Key); err != nil {
+				return fmt.Errorf("remove expired block record for %s: %w", displayName(user), err)
+			}
+			m.forgetBlockLocked(existing)
 		}
-		m.forgetBlockLocked(existing)
 	}
 
 	if user.Status == panel.StatusDisabled {
@@ -215,15 +244,21 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 			} else {
 				m.forgetBlockLocked(record)
 			}
+			m.notifyFailure(record, "block", err, 0, 0)
 			return fmt.Errorf("disable user %s: %w", displayName(user), err)
 		}
+		m.recordFailure(record, "block", fmt.Errorf("disable user: %w", err))
 		return fmt.Errorf("disable user %s (outcome unknown; will reconcile): %w", displayName(user), err)
 	}
 	if updated == nil {
-		return fmt.Errorf("disable user %s: panel returned an empty response", displayName(user))
+		cause := errors.New("panel returned an empty response")
+		m.recordFailure(record, "block", cause)
+		return fmt.Errorf("disable user %s: %w", displayName(user), cause)
 	}
 	if updated.Status != panel.StatusDisabled {
-		return fmt.Errorf("disable user %s: panel returned status %q", displayName(user), updated.Status)
+		cause := fmt.Errorf("panel returned status %q", updated.Status)
+		m.recordFailure(record, "block", cause)
+		return fmt.Errorf("disable user %s: %w", displayName(user), cause)
 	}
 	record.State = storage.StateActive
 	record.Notified = true
@@ -240,6 +275,101 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 	return nil
 }
 
+// handleResolveFailure keeps a durable pending record when the panel cannot be
+// reached before a block can be resolved. It deliberately does not drop the
+// detection: the expiry worker will retry resolution and apply the block (or
+// discard it if the window has already elapsed).
+func (m *Manager) handleResolveFailure(ctx context.Context, det logwatch.Detection, now time.Time, duration time.Duration, cause error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, userID, username, err := m.provisionalIdentityKey(det.Identity)
+	if err != nil {
+		return fmt.Errorf("resolve user %q: %w", det.Identity, cause)
+	}
+
+	if existing, ok := m.store.Get(key); ok {
+		if existing.State == storage.StateActive {
+			if now.Before(existing.BlockedUntil) {
+				if updated, extended := m.extendBlockLocked(existing, det, now, duration); extended {
+					m.logExtended(updated, now)
+					return nil
+				}
+			}
+			return fmt.Errorf("resolve user %q: %w", det.Identity, cause)
+		}
+		if now.Before(existing.BlockedUntil) {
+			m.logf("pending block for %s; resolve will be retried after backoff", displayName(recordUser(existing)))
+			return nil
+		}
+		m.reconcilePending(ctx, existing)
+		return nil
+	}
+
+	record := storage.Block{
+		Key:          key,
+		UserID:       userID,
+		Username:     username,
+		IP:           det.IP,
+		TelegramID:   det.TelegramID,
+		BlockedAt:    now,
+		BlockedUntil: now.Add(duration),
+		State:        storage.StatePending,
+		Unresolved:   true,
+	}
+
+	// A definitive 401/403/404/422 will not improve by retrying. Report it,
+	// but do not create a record that can never succeed.
+	if panel.IsDefinitive(cause) {
+		m.notifyFailure(record, "block", cause, 0, 0)
+		return fmt.Errorf("resolve user %q: %w", det.Identity, cause)
+	}
+
+	if err := m.store.Put(record); err != nil {
+		return fmt.Errorf("persist unresolved block for %q: %w", det.Identity, err)
+	}
+	m.recordFailure(record, "block", cause)
+	return fmt.Errorf("resolve user %q (will retry): %w", det.Identity, cause)
+}
+
+// provisionalIdentityKey builds the journal key used before the panel has
+// resolved an identity to a user ID.
+func (m *Manager) provisionalIdentityKey(identity string) (string, int, string, error) {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return "", 0, "", errors.New("empty identity")
+	}
+	if m.cfg.PasarGuard.Identifier != "username" {
+		if id, err := parseUserID(identity); err == nil {
+			return "id:" + strconv.Itoa(id), id, "", nil
+		}
+		if m.cfg.PasarGuard.Identifier == "id" {
+			return "", 0, "", fmt.Errorf("identity %q is not numeric", identity)
+		}
+	}
+	return "username:" + identity, 0, identity, nil
+}
+
+// findRecordForUser finds a record under either the numeric-ID or username
+// key. This handles an unresolved username record that later resolves to an ID
+// without creating a second record for the same account.
+func (m *Manager) findRecordForUser(user *panel.User) (storage.Block, bool) {
+	if user == nil {
+		return storage.Block{}, false
+	}
+	if user.ID > 0 {
+		if record, ok := m.store.Get("id:" + strconv.Itoa(user.ID)); ok {
+			return record, true
+		}
+	}
+	if user.Username != "" {
+		if record, ok := m.store.Get("username:" + user.Username); ok {
+			return record, true
+		}
+	}
+	return storage.Block{}, false
+}
+
 // Run reconciles pending records and lifts expired blocks until ctx is done.
 func (m *Manager) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
@@ -249,18 +379,34 @@ func (m *Manager) Run(ctx context.Context, interval time.Duration) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	flushTicker := time.NewTicker(time.Second)
+	defer flushTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			if err := m.store.Flush(); err != nil {
+				m.logf("could not flush extended blocks on shutdown: %v", err)
+			}
 			return
 		case <-ticker.C:
 			m.ProcessExpired(ctx)
+		case <-flushTicker.C:
+			if err := m.store.Flush(); err != nil {
+				m.logf("could not flush extended blocks: %v", err)
+			}
 		}
 	}
 }
 
 // ProcessExpired reconciles pending records and unblocks expired accounts.
 func (m *Manager) ProcessExpired(ctx context.Context) {
+	// Extensions are coalesced; persist them whenever the expiry worker runs.
+	defer func() {
+		if err := m.store.Flush(); err != nil {
+			m.logf("could not flush extended blocks: %v", err)
+		}
+	}()
+
 	// Snapshot keys first; each record is re-read under the lock so a block
 	// created while this loop runs is never lifted accidentally.
 	for _, snapshot := range m.store.List() {
@@ -298,6 +444,7 @@ func (m *Manager) processOne(ctx context.Context, key string) {
 }
 
 func (m *Manager) reconcilePending(ctx context.Context, record storage.Block) {
+	now := m.now()
 	user, err := m.getRecordUser(ctx, record)
 	if err != nil {
 		if panel.IsNotFound(err) {
@@ -309,26 +456,77 @@ func (m *Manager) reconcilePending(ctx context.Context, record storage.Block) {
 			m.logf("pending block for %s: user no longer exists; record removed", displayName(recordUser(record)))
 			return
 		}
-		m.recordFailure(record, fmt.Errorf("reconcile pending block: %w", err))
+		m.recordFailure(record, "block", fmt.Errorf("reconcile pending block: %w", err))
 		return
 	}
 
-	if user.Status != panel.StatusDisabled {
+	record.UserID = firstNonZero(user.ID, record.UserID)
+	record.Username = firstNonEmpty(user.Username, record.Username)
+
+	if user.Status == panel.StatusDisabled {
+		if record.Unresolved {
+			// We never reached the disable call, so this account was already
+			// disabled by someone else. Never enable it.
+			record.PreExistingDisabled = true
+		}
+		record.Unresolved = false
+		record.State = storage.StateActive
+		if record.PreviousStatus == "" {
+			record.PreviousStatus = panel.StatusDisabled
+		}
+		record.Notified = true
+		record.Attempts = 0
+		record.NextAttempt = time.Time{}
+		if err := m.store.Put(record); err != nil {
+			m.logf("could not persist reconciled block for %s: %v", displayName(user), err)
+			return
+		}
+		m.rememberBlockLocked(record)
+		m.notifyBlock(record, user)
+		m.logf("reconciled pending block for user %s (id %d) until %s (pre-existing disabled: %t)",
+			displayName(user), user.ID, record.BlockedUntil.Format(time.RFC3339), record.PreExistingDisabled)
+		return
+	}
+
+	// The account is not disabled. If the intended block window already
+	// elapsed, do not disable it late.
+	if !now.Before(record.BlockedUntil) {
 		if removeErr := m.store.Remove(record.Key); removeErr != nil {
-			m.logf("could not remove ineffective pending record for %s: %v", displayName(user), removeErr)
+			m.logf("could not remove expired pending record for %s: %v", displayName(user), removeErr)
 		} else {
 			m.forgetBlockLocked(record)
 		}
-		m.logf("pending block for %s did not take effect (panel status %q); record removed",
+		m.logf("pending block for %s expired before it took effect (panel status %q); record removed",
 			displayName(user), user.Status)
 		return
 	}
 
+	// The panel did not apply the pending disable, or the earlier request
+	// failed. Retry the disable instead of dropping the block.
+	updated, err := m.setDisabled(ctx, user, true)
+	if err != nil {
+		if panel.IsDefinitive(err) {
+			if removeErr := m.store.Remove(record.Key); removeErr != nil {
+				m.logf("could not remove failed pending record for %s: %v", displayName(user), removeErr)
+			} else {
+				m.forgetBlockLocked(record)
+			}
+			m.notifyFailure(record, "block", err, 0, 0)
+			return
+		}
+		m.recordFailure(record, "block", fmt.Errorf("retry pending disable: %w", err))
+		return
+	}
+	if updated == nil || updated.Status != panel.StatusDisabled {
+		m.recordFailure(record, "block", errors.New("panel did not report disabled after retried disable"))
+		return
+	}
+
 	record.State = storage.StateActive
-	record.UserID = firstNonZero(user.ID, record.UserID)
-	record.Username = firstNonEmpty(user.Username, record.Username)
+	record.Unresolved = false
+	record.PreExistingDisabled = false
 	if record.PreviousStatus == "" {
-		record.PreviousStatus = panel.StatusActive
+		record.PreviousStatus = user.Status
 	}
 	record.Notified = true
 	record.Attempts = 0
@@ -339,7 +537,7 @@ func (m *Manager) reconcilePending(ctx context.Context, record storage.Block) {
 	}
 	m.rememberBlockLocked(record)
 	m.notifyBlock(record, user)
-	m.logf("reconciled pending block for user %s (id %d) until %s",
+	m.logf("reconciled pending block for user %s (id %d) until %s after retrying disable",
 		displayName(user), user.ID, record.BlockedUntil.Format(time.RFC3339))
 }
 
@@ -377,7 +575,7 @@ func (m *Manager) unblock(ctx context.Context, record storage.Block) {
 			m.logf("block expired for %s, but the user no longer exists; record removed", displayName(recordUser(record)))
 			return
 		}
-		m.recordFailure(record, fmt.Errorf("load user for unblock: %w", err))
+		m.recordFailure(record, "unblock", fmt.Errorf("load user for unblock: %w", err))
 		return
 	}
 
@@ -394,11 +592,11 @@ func (m *Manager) unblock(ctx context.Context, record storage.Block) {
 
 	updated, err := m.setDisabled(ctx, user, false)
 	if err != nil {
-		m.recordFailure(record, fmt.Errorf("enable user: %w", err))
+		m.recordFailure(record, "unblock", fmt.Errorf("enable user: %w", err))
 		return
 	}
 	if updated == nil || updated.Status == panel.StatusDisabled {
-		m.recordFailure(record, errors.New("panel still reports status disabled after enable request"))
+		m.recordFailure(record, "unblock", errors.New("panel still reports status disabled after enable request"))
 		return
 	}
 
@@ -497,15 +695,35 @@ func (m *Manager) notifyBlock(record storage.Block, user *panel.User) {
 	m.notifier.Block(event)
 }
 
-func (m *Manager) recordFailure(record storage.Block, cause error) {
+func (m *Manager) recordFailure(record storage.Block, action string, cause error) {
 	record.Attempts++
 	delay := retryDelay(record.Attempts)
 	record.NextAttempt = m.now().Add(delay)
 	if err := m.store.Put(record); err != nil {
 		m.logf("could not persist retry state for %s: %v", displayName(recordUser(record)), err)
 	}
-	m.logf("block operation for %s failed (attempt %d, retry in %s): %v",
-		displayName(recordUser(record)), record.Attempts, delay.Round(time.Second), cause)
+	m.logf("%s operation for %s failed (attempt %d, retry in %s): %v",
+		action, displayName(recordUser(record)), record.Attempts, delay.Round(time.Second), cause)
+	if !errors.Is(cause, context.Canceled) {
+		m.notifyFailure(record, action, cause, record.Attempts, delay)
+	}
+}
+
+func (m *Manager) notifyFailure(record storage.Block, action string, cause error, attempt int, retry time.Duration) {
+	notifier, ok := m.notifier.(FailureNotifier)
+	if !ok {
+		return
+	}
+	event := notify.Event{
+		Username:        record.Username,
+		UserID:          record.UserID,
+		IP:              record.IP,
+		Hostname:        m.cfg.Hostname,
+		DurationMinutes: m.cfg.BlockDuration,
+		Timestamp:       m.now(),
+		TelegramID:      record.TelegramID,
+	}
+	notifier.Failure(event, action, cause, attempt, retry)
 }
 
 // rebuildIdentityCache repopulates the duplicate fast-path after a restart.
@@ -528,12 +746,35 @@ func (m *Manager) rememberBlockLocked(record storage.Block) {
 	}
 }
 
+// extendBlockLocked applies a sliding expiry. The write is coalesced in the
+// store and flushed by Run's short ticker, so a busy torrent does not fsync the
+// journal for every connection.
+func (m *Manager) extendBlockLocked(record storage.Block, det logwatch.Detection, now time.Time, duration time.Duration) (storage.Block, bool) {
+	updated, ok := m.store.Extend(record.Key, now.Add(duration), det.IP, det.TelegramID)
+	if !ok {
+		return storage.Block{}, false
+	}
+	m.rememberBlockLocked(updated)
+	return updated, true
+}
+
+// logExtended rate-limits the extension message to once per minute per user.
+func (m *Manager) logExtended(record storage.Block, now time.Time) {
+	if last, ok := m.touchLogged[record.Key]; ok && now.Sub(last) < time.Minute {
+		return
+	}
+	m.touchLogged[record.Key] = now
+	m.logf("extended block for %s (id %d) until %s (new torrent detection)",
+		displayName(recordUser(record)), record.UserID, record.BlockedUntil.Format(time.RFC3339))
+}
+
 func (m *Manager) forgetBlockLocked(record storage.Block) {
 	for key, entry := range m.identityCache {
 		if entry.Key == record.Key {
 			delete(m.identityCache, key)
 		}
 	}
+	delete(m.touchLogged, record.Key)
 }
 
 func (m *Manager) detectionCacheKey(identity string) string {

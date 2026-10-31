@@ -1,6 +1,6 @@
 # PasarGuard Torrent Blocker
 
-Current build: **v0.3.1-pg.5**
+Current build: **v0.3.1-pg.7**
 
 A fork of [kutovoys/xray-torrent-blocker](https://github.com/kutovoys/xray-torrent-blocker)
 based on **v0.3.1**, the last release with Telegram support, reworked to block
@@ -42,16 +42,68 @@ For every access-log line containing `TorrentTag`:
    `PUT /api/user/by-id/42/disabled` with `{"disabled":true}`, verify the
    response says `disabled`, and mark the record **active**.
 5. Notify Telegram/webhook.
-6. An expiry worker runs every `CheckIntervalSeconds` (default 15). When
+6. Every new torrent line for an active block moves `BlockedUntil` to
+   `now + BlockDuration`. Duplicate lines do not call the panel again; the
+   journal update is coalesced and flushed about once per second.
+7. An expiry worker runs every `CheckIntervalSeconds` (default 15). When
    `BlockedUntil` passes it reads the user again and, if the account is still
    disabled, sends `{"disabled":false}`. The panel then restores the correct
    status (`active`, `limited`, `expired`, or `on_hold`).
 
+`BlockDuration` is therefore an **idle timeout**, not a fixed duration from the
+first detection. A user who keeps torrenting stays blocked; the timer starts
+counting down only after the last torrent line. The same sliding timer applies
+to a pre-existing-disabled record, but that record still never enables the
+account.
+
+`BlockDuration` is expressed in whole minutes (minimum 1). For a short expiry
+test use `BlockDuration: 1` and `CheckIntervalSeconds: 5`; the sliding logic
+works at whatever duration is configured.
+
 The journal is written before the API call. If the process dies or the panel
 times out mid-request, the pending record is reconciled on the next tick: if the
-panel says disabled, the block becomes active; if not, the record is dropped.
+panel says disabled, the block becomes active; if the account is still active
+and the block window has not elapsed, tblocker retries the disable; if the
+window already elapsed, it drops the record instead of disabling the user late.
 This avoids the two dangerous failure modes: an account left disabled forever,
 and an account re-enabled too early.
+
+## Restart and failure recovery
+
+At startup tblocker immediately runs an expiry/reconciliation pass.
+
+- An **active block past `BlockedUntil`** is enabled right away, even if the
+  service was down for hours (unless `ReenableOnUnblock` is false). Example:
+  block expires at 04:00, service was crashed from 03:50 to 04:30 — on restart
+  at 04:30 it calls `disabled:false`.
+- An **active block before `BlockedUntil`** stays disabled; the timer is not
+  reset by the restart.
+- A **pending block** is reconciled: if the panel is disabled it becomes active;
+  if the user is active and the window remains, the disable is retried; if the
+  window has passed, the pending record is dropped.
+- A **pre-existing-disabled** record is removed at expiry without enabling the
+  account.
+
+Panel requests that fail with a network error, timeout, 429, or 5xx are
+retried with exponential backoff: **15s, 30s, 1m, 2m, 4m, 8m, then 10m**. The
+`next_attempt` and attempt count are stored in `blocks.json`, so retries
+survive a restart.
+
+- **Block path:** if the first resolve or disable fails with a non-definitive
+  error, tblocker writes a durable pending record (for a resolve failure, keyed
+  by the numeric ID or username). It retries from the expiry worker; a successful retry disables the
+  account and sends the normal block notification. If the block window expires
+  before the panel recovers, it does not disable the user late.
+- **Unblock path:** the active record is kept, the failure is recorded, and the
+  enable is retried until it succeeds or the user disappears.
+- **Definitive 4xx errors during resolve/disable** (401/403/404/409/422) are
+  not retried. Any pending record is removed and the administrator is alerted.
+
+Failure notifications go to the **admin Telegram chat** when
+`SendAdminMessage: true`. They include the action (`block`/`unblock`), user,
+error, attempt number, and next retry. A later success sends the usual block or
+unblock message. The end user is not notified about transport failures. If admin
+Telegram is disabled, failures are only logged.
 
 ## Requirements
 
@@ -199,7 +251,7 @@ The full annotated file is [`config.yaml.example`](config.yaml.example).
 | Key | Default | Meaning |
 |---|---|---|
 | `LogFile` | required | Xray access log to follow |
-| `BlockDuration` | required | block length in minutes (> 0) |
+| `BlockDuration` | required | idle ban length in minutes; resets on each new detection (> 0) |
 | `TorrentTag` | `TORRENT` | substring that marks a torrent line |
 | `StorageDir` | `/opt/tblocker` | directory for `blocks.json` |
 | `Hostname` | system hostname | name in admin notifications |

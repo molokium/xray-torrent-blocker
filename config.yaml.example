@@ -9,7 +9,8 @@
 # that user (ACL) or the service will log a permission error and never detect.
 LogFile: "/var/lib/pg-node/access.log"
 
-# Required. Block duration in minutes. Must be greater than 0.
+# Required. Idle ban duration in minutes. Every new torrent line for a blocked
+# account resets the timer to this value. Must be greater than 0.
 BlockDuration: 10
 
 # Tag that identifies torrent lines in the access log. Keep it in sync with the

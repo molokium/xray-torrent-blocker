@@ -4,6 +4,7 @@ package notify
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -86,6 +87,48 @@ func (d *Dispatcher) Unblock(event Event) {
 	if d.cfg.SendWebhook {
 		go d.sendWebhook(event, "unblock")
 	}
+}
+
+// Failure notifies the administrator that a block or unblock could not be
+// applied and whether it will be retried. It is deliberately admin-only: a
+// transport failure is not something the end user should be told about.
+func (d *Dispatcher) Failure(event Event, action string, cause error, attempt int, retry time.Duration) {
+	if !d.cfg.SendAdminMessage {
+		return
+	}
+	username := event.Username
+	if username == "" {
+		username = fmt.Sprintf("user-%d", event.UserID)
+	}
+	reason := "unknown error"
+	if cause != nil {
+		reason = cause.Error()
+	}
+	retryText := "no automatic retry"
+	if retry > 0 {
+		retryText = retry.Round(time.Second).String()
+	}
+	attemptText := fmt.Sprintf("%d", attempt)
+	if attempt == 0 {
+		attemptText = "n/a"
+	}
+	text := fmt.Sprintf(
+		"<b>tblocker: %s failed</b>\nUser: <code>%s</code>\nID: %d\nError: <code>%s</code>\nAttempt: %s\nRetry in: %s",
+		html.EscapeString(action),
+		html.EscapeString(username),
+		event.UserID,
+		html.EscapeString(shorten(reason, 500)),
+		html.EscapeString(attemptText),
+		html.EscapeString(retryText),
+	)
+	go d.sendTelegram(d.cfg.AdminBotToken, d.cfg.AdminChatID, text, event)
+}
+
+func shorten(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	return value[:max] + "..."
 }
 
 func (d *Dispatcher) userMessage(event Event) string {

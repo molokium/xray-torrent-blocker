@@ -187,10 +187,19 @@ func (f *fakePanel) setStatus(id int, status string) {
 	}
 }
 
+type fakeFailure struct {
+	event   notify.Event
+	action  string
+	cause   error
+	attempt int
+	retry   time.Duration
+}
+
 type fakeNotifier struct {
 	mu       sync.Mutex
 	blocks   []notify.Event
 	unblocks []notify.Event
+	failures []fakeFailure
 }
 
 func (n *fakeNotifier) Block(event notify.Event) {
@@ -215,6 +224,18 @@ func (n *fakeNotifier) unblockEvents() []notify.Event {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return append([]notify.Event(nil), n.unblocks...)
+}
+
+func (n *fakeNotifier) Failure(event notify.Event, action string, cause error, attempt int, retry time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.failures = append(n.failures, fakeFailure{event: event, action: action, cause: cause, attempt: attempt, retry: retry})
+}
+
+func (n *fakeNotifier) failureEvents() []fakeFailure {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]fakeFailure(nil), n.failures...)
 }
 
 type fakeClock struct {
@@ -454,6 +475,7 @@ func TestHandleUnknownErrorKeepsPendingAndReconciles(t *testing.T) {
 	}
 
 	fp.setError(nil)
+	clock.Advance(16 * time.Second)
 	manager.ProcessExpired(context.Background())
 
 	block = mustBlock(t, store, "id:7")
@@ -465,7 +487,7 @@ func TestHandleUnknownErrorKeepsPendingAndReconciles(t *testing.T) {
 	}
 }
 
-func TestPendingReconcileDropsWhenPanelActive(t *testing.T) {
+func TestPendingReconcileRetriesDisable(t *testing.T) {
 	clock := newFakeClock()
 	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
 	manager, notifier, store := newTestManager(t, testConfig(), fp, clock)
@@ -482,11 +504,40 @@ func TestPendingReconcileDropsWhenPanelActive(t *testing.T) {
 	}
 
 	manager.ProcessExpired(context.Background())
-	if store.Len() != 0 {
-		t.Errorf("pending record was not removed: %+v", store.List())
+	block := mustBlock(t, store, "id:7")
+	if block.State != storage.StateActive {
+		t.Errorf("state = %q, want active", block.State)
 	}
-	if len(notifier.blockEvents()) != 0 {
-		t.Error("unexpected notification")
+	if calls := fp.calls(); len(calls) != 1 || !calls[0].Disabled {
+		t.Errorf("retry disable calls = %+v", calls)
+	}
+	if len(notifier.blockEvents()) != 1 {
+		t.Errorf("block events = %d, want 1", len(notifier.blockEvents()))
+	}
+}
+
+func TestPendingReconcileExpiredActiveDropsWithoutLateDisable(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	manager, _, store := newTestManager(t, testConfig(), fp, clock)
+
+	if err := store.Put(storage.Block{
+		Key:            "id:7",
+		UserID:         7,
+		Username:       "alice",
+		BlockedUntil:   clock.Now().Add(-time.Minute),
+		PreviousStatus: panel.StatusActive,
+		State:          storage.StatePending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.ProcessExpired(context.Background())
+	if store.Len() != 0 {
+		t.Errorf("expired pending record was not removed: %+v", store.List())
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Errorf("late disable was attempted: %+v", calls)
 	}
 }
 
@@ -980,5 +1031,249 @@ func TestResolveErrorsAreWrapped(t *testing.T) {
 	err := manager.Handle(context.Background(), testDetection("7", "", ""))
 	if err == nil || !strings.Contains(err.Error(), "resolve user") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestHandleDuplicateDetectionExtendsBlock(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	manager, notifier, store := newTestManager(t, testConfig(), fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "203.0.113.9", "")); err != nil {
+		t.Fatal(err)
+	}
+	first := mustBlock(t, store, "id:7")
+	if want := clock.Now().Add(10 * time.Minute); !first.BlockedUntil.Equal(want) {
+		t.Fatalf("first expiry = %s, want %s", first.BlockedUntil, want)
+	}
+
+	clock.Advance(2 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "203.0.113.10", "")); err != nil {
+		t.Fatal(err)
+	}
+	second := mustBlock(t, store, "id:7")
+	if want := clock.Now().Add(10 * time.Minute); !second.BlockedUntil.Equal(want) {
+		t.Fatalf("extended expiry = %s, want %s", second.BlockedUntil, want)
+	}
+	if second.BlockedAt != first.BlockedAt {
+		t.Errorf("BlockedAt changed from %s to %s", first.BlockedAt, second.BlockedAt)
+	}
+	if second.IP != "203.0.113.10" {
+		t.Errorf("IP = %q, want latest detection IP", second.IP)
+	}
+	if calls := fp.calls(); len(calls) != 1 {
+		t.Errorf("panel calls = %d, want 1", len(calls))
+	}
+	if events := len(notifier.blockEvents()); events != 1 {
+		t.Errorf("block events = %d, want 1", events)
+	}
+}
+
+func TestHandleAlreadyDisabledExtendsBlock(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusDisabled})
+	manager, notifier, store := newTestManager(t, testConfig(), fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	first := mustBlock(t, store, "id:7")
+	if !first.PreExistingDisabled {
+		t.Fatal("record is not marked pre-existing")
+	}
+
+	clock.Advance(3 * time.Minute)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	second := mustBlock(t, store, "id:7")
+	if want := clock.Now().Add(10 * time.Minute); !second.BlockedUntil.Equal(want) {
+		t.Fatalf("extended expiry = %s, want %s", second.BlockedUntil, want)
+	}
+	if !second.PreExistingDisabled {
+		t.Error("pre-existing flag was lost")
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Errorf("panel was modified: %+v", calls)
+	}
+	if events := len(notifier.blockEvents()); events != 1 {
+		t.Errorf("block events = %d, want 1", events)
+	}
+}
+
+func TestRestartAfterExpiryUnblocks(t *testing.T) {
+	dir := t.TempDir()
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+
+	store1, err := storage.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager1 := New(testConfig(), store1, fp, &fakeNotifier{}, WithClock(clock.Now), WithLogger(log.New(io.Discard, "", 0)))
+	if err := manager1.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The service was down across the expiry; startup must lift the block.
+	clock.Advance(11 * time.Minute)
+	store2, err := storage.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := &fakeNotifier{}
+	manager2 := New(testConfig(), store2, fp, notifier, WithClock(clock.Now), WithLogger(log.New(io.Discard, "", 0)))
+	manager2.ProcessExpired(context.Background())
+
+	calls := fp.calls()
+	if len(calls) != 2 {
+		t.Fatalf("calls = %+v, want disable + enable", calls)
+	}
+	if calls[1].Disabled {
+		t.Errorf("second call was not an enable: %+v", calls[1])
+	}
+	if store2.Len() != 0 {
+		t.Errorf("record was not removed: %+v", store2.List())
+	}
+	if len(notifier.unblockEvents()) != 1 {
+		t.Errorf("unblock notifications = %d, want 1", len(notifier.unblockEvents()))
+	}
+}
+
+func TestResolveFailurePersistsPendingAndRetries(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	fp.getErr = errors.New("network down")
+	manager, notifier, store := newTestManager(t, testConfig(), fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err == nil {
+		t.Fatal("expected resolve error")
+	}
+	block := mustBlock(t, store, "id:7")
+	if block.State != storage.StatePending || !block.Unresolved {
+		t.Fatalf("block = %+v, want pending unresolved", block)
+	}
+	if failures := notifier.failureEvents(); len(failures) != 1 || failures[0].action != "block" {
+		t.Fatalf("failure notifications = %+v", failures)
+	}
+
+	fp.getErr = nil
+	clock.Advance(16 * time.Second)
+	manager.ProcessExpired(context.Background())
+
+	block = mustBlock(t, store, "id:7")
+	if block.State != storage.StateActive || block.Unresolved || block.PreExistingDisabled {
+		t.Fatalf("reconciled block = %+v", block)
+	}
+	if calls := fp.calls(); len(calls) != 1 || !calls[0].Disabled {
+		t.Errorf("disable calls = %+v", calls)
+	}
+	if len(notifier.blockEvents()) != 1 {
+		t.Errorf("block notifications = %d, want 1", len(notifier.blockEvents()))
+	}
+}
+
+func TestBlockFailureNotifiesAdmin(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	fp.setErr = serverError()
+	manager, notifier, store := newTestManager(t, testConfig(), fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err == nil {
+		t.Fatal("expected error")
+	}
+	if store.Len() != 1 {
+		t.Fatalf("pending record was not kept: %+v", store.List())
+	}
+	failures := notifier.failureEvents()
+	if len(failures) != 1 || failures[0].action != "block" || failures[0].retry <= 0 {
+		t.Fatalf("failure notifications = %+v", failures)
+	}
+}
+
+func TestUnblockFailureNotifiesAdmin(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	manager, notifier, store := newTestManager(t, testConfig(), fp, clock)
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	fp.setError(serverError())
+	clock.Advance(11 * time.Minute)
+	manager.ProcessExpired(context.Background())
+
+	if store.Len() != 1 {
+		t.Fatalf("record was not kept for retry: %+v", store.List())
+	}
+	failures := notifier.failureEvents()
+	if len(failures) != 1 || failures[0].action != "unblock" || failures[0].retry <= 0 {
+		t.Fatalf("failure notifications = %+v", failures)
+	}
+}
+
+func TestResolveFailureThenDisabledUserIsPreExisting(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	fp.getErr = errors.New("network down")
+	manager, _, store := newTestManager(t, testConfig(), fp, clock)
+
+	if err := manager.Handle(context.Background(), testDetection("7", "", "")); err == nil {
+		t.Fatal("expected resolve error")
+	}
+	fp.getErr = nil
+	fp.setStatus(7, panel.StatusDisabled)
+	clock.Advance(16 * time.Second)
+	manager.ProcessExpired(context.Background())
+
+	block := mustBlock(t, store, "id:7")
+	if !block.PreExistingDisabled || block.Unresolved || block.State != storage.StateActive {
+		t.Fatalf("block = %+v, want active pre-existing", block)
+	}
+	if calls := fp.calls(); len(calls) != 0 {
+		t.Fatalf("panel was modified: %+v", calls)
+	}
+}
+
+func TestUnresolvedPendingSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	fp.getErr = errors.New("network down")
+
+	store1, err := storage.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager1 := New(testConfig(), store1, fp, &fakeNotifier{}, WithClock(clock.Now), WithLogger(log.New(io.Discard, "", 0)))
+	if err := manager1.Handle(context.Background(), testDetection("7", "", "")); err == nil {
+		t.Fatal("expected resolve error")
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fp.getErr = nil
+	clock.Advance(16 * time.Second)
+	store2, err := storage.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := &fakeNotifier{}
+	manager2 := New(testConfig(), store2, fp, notifier, WithClock(clock.Now), WithLogger(log.New(io.Discard, "", 0)))
+	manager2.ProcessExpired(context.Background())
+
+	block := mustBlock(t, store2, "id:7")
+	if block.State != storage.StateActive {
+		t.Fatalf("state = %q, want active", block.State)
+	}
+	if calls := fp.calls(); len(calls) != 1 || !calls[0].Disabled {
+		t.Errorf("calls = %+v", calls)
+	}
+	if len(notifier.blockEvents()) != 1 {
+		t.Errorf("block events = %d", len(notifier.blockEvents()))
 	}
 }

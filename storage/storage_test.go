@@ -282,3 +282,65 @@ func TestNewRejectsFileAsDirectory(t *testing.T) {
 		t.Fatal("expected an error when storage path is a file")
 	}
 }
+
+func TestExtendAndFlushPersists(t *testing.T) {
+	dir := t.TempDir()
+	store, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	block := Block{
+		Key:          "id:7",
+		UserID:       7,
+		Username:     "alice",
+		IP:           "203.0.113.9",
+		BlockedAt:    now,
+		BlockedUntil: now.Add(10 * time.Minute),
+		State:        StateActive,
+	}
+	if err := store.Put(block); err != nil {
+		t.Fatal(err)
+	}
+
+	until := now.Add(20 * time.Minute)
+	updated, ok := store.Extend("id:7", until, "203.0.113.10", "777")
+	if !ok {
+		t.Fatal("Extend returned false")
+	}
+	if !updated.BlockedUntil.Equal(until) || updated.IP != "203.0.113.10" || updated.TelegramID != "777" {
+		t.Fatalf("updated = %+v", updated)
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := reopened.Get("id:7")
+	if !ok {
+		t.Fatal("record missing after reopen")
+	}
+	if !got.BlockedUntil.Equal(until) || got.IP != "203.0.113.10" || got.TelegramID != "777" {
+		t.Fatalf("persisted = %+v", got)
+	}
+}
+
+func TestExtendIgnoresPendingAndMissing(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.Put(Block{Key: "id:1", UserID: 1, BlockedAt: now, BlockedUntil: now.Add(time.Minute), State: StatePending}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Extend("id:1", now.Add(time.Hour), "", ""); ok {
+		t.Fatal("Extend changed a pending record")
+	}
+	if _, ok := store.Extend("id:404", now.Add(time.Hour), "", ""); ok {
+		t.Fatal("Extend changed a missing record")
+	}
+}
