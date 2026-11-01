@@ -231,6 +231,9 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 				existing.BlockedAt = now
 				existing.BlockedUntil = now.Add(duration)
 				existing.IP = det.IP
+				if det.Inbound != "" {
+					existing.Inbound = det.Inbound
+				}
 				existing.State = storage.StateActive
 				existing.FailsafeTriggered = false
 				existing.Notified = true
@@ -263,6 +266,7 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 			UserID:              user.ID,
 			Username:            user.Username,
 			IP:                  det.IP,
+			Inbound:             det.Inbound,
 			TelegramID:          telegramID,
 			BlockedAt:           now,
 			BlockedUntil:        now.Add(duration),
@@ -287,6 +291,7 @@ func (m *Manager) Handle(ctx context.Context, det logwatch.Detection) error {
 		UserID:         user.ID,
 		Username:       user.Username,
 		IP:             det.IP,
+		Inbound:        det.Inbound,
 		TelegramID:     telegramID,
 		BlockedAt:      now,
 		BlockedUntil:   now.Add(duration),
@@ -377,6 +382,7 @@ func (m *Manager) handleResolveFailure(ctx context.Context, det logwatch.Detecti
 		UserID:       userID,
 		Username:     username,
 		IP:           det.IP,
+		Inbound:      det.Inbound,
 		TelegramID:   det.TelegramID,
 		BlockedAt:    now,
 		BlockedUntil: now.Add(duration),
@@ -680,6 +686,7 @@ func (m *Manager) unblock(ctx context.Context, record storage.Block) {
 		Username:        firstNonEmpty(user.Username, record.Username),
 		UserID:          firstNonZero(user.ID, record.UserID),
 		IP:              record.IP,
+		Inbound:         record.Inbound,
 		Hostname:        m.cfg.Hostname,
 		DurationMinutes: m.cfg.BlockDuration,
 		Timestamp:       m.now(),
@@ -757,6 +764,7 @@ func (m *Manager) notifyBlock(record storage.Block, user *panel.User) {
 		Username:        firstNonEmpty(user.Username, record.Username),
 		UserID:          firstNonZero(user.ID, record.UserID),
 		IP:              record.IP,
+		Inbound:         record.Inbound,
 		Hostname:        m.cfg.Hostname,
 		DurationMinutes: m.cfg.BlockDuration,
 		Timestamp:       m.now(),
@@ -788,6 +796,7 @@ func (m *Manager) notifyFailure(record storage.Block, action string, cause error
 		Username:        record.Username,
 		UserID:          record.UserID,
 		IP:              record.IP,
+		Inbound:         record.Inbound,
 		Hostname:        m.cfg.Hostname,
 		DurationMinutes: m.cfg.BlockDuration,
 		Timestamp:       m.now(),
@@ -820,7 +829,7 @@ func (m *Manager) rememberBlockLocked(record storage.Block) {
 // store and flushed by Run's short ticker, so a busy torrent does not fsync the
 // journal for every connection.
 func (m *Manager) extendBlockLocked(record storage.Block, det logwatch.Detection, now time.Time, duration time.Duration) (storage.Block, bool) {
-	updated, ok := m.store.Extend(record.Key, now.Add(duration), det.IP, det.TelegramID)
+	updated, ok := m.store.Extend(record.Key, now.Add(duration), det.IP, det.Inbound, det.TelegramID)
 	if !ok {
 		return storage.Block{}, false
 	}
@@ -947,6 +956,7 @@ func (m *Manager) finishFailsafe(record storage.Block, reconnected, failed []str
 		Username:        record.Username,
 		UserID:          record.UserID,
 		IP:              record.IP,
+		Inbound:         record.Inbound,
 		Hostname:        m.cfg.Hostname,
 		DurationMinutes: m.cfg.BlockDuration,
 		Timestamp:       m.now(),

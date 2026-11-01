@@ -1,6 +1,6 @@
 # QA record
 
-Version: `v0.3.1-pg.9` (fork of xray-torrent-blocker v0.3.1)
+Version: `v0.3.1-pg.10` (fork of xray-torrent-blocker v0.3.1)
 
 ## Environment
 
@@ -18,10 +18,10 @@ $ go test -race -shuffle=on -cover ./...
 ok  tblocker            1.033s  coverage: 10.1% of statements
 ok  tblocker/blocker    1.257s  coverage: 73.1% of statements
 ok  tblocker/config     1.059s  coverage: 93.2% of statements
-ok  tblocker/logwatch   7.192s  coverage: 86.2% of statements
-ok  tblocker/notify     1.332s  coverage: 80.0% of statements
+ok  tblocker/logwatch   7.185s  coverage: 86.6% of statements
+ok  tblocker/notify     1.324s  coverage: 79.7% of statements
 ok  tblocker/panel      1.556s  coverage: 80.0% of statements
-ok  tblocker/storage    1.120s  coverage: 82.1% of statements
+ok  tblocker/storage    1.107s  coverage: 82.4% of statements
 ```
 
 `go vet ./...` is clean. `gofmt -l .` is empty. `shellcheck install.sh` and
@@ -61,6 +61,10 @@ The security review in `README.md` is backed by these tests:
 | `TestDetectionToleranceDefaults` | absent keys preserve immediate blocking |
 | `TestDetectionToleranceConfigured` | explicit threshold/window are loaded |
 | `TestDetectionToleranceValidation` | out-of-range tolerance is rejected |
+| `TestParseLineInboundTag` | `[vless-in >> TORRENT]` yields `vless-in`; missing/invalid fields yield empty |
+| `TestInboundIsPersistedAndSentToAdmin` | inbound is stored in the block and passed to the admin event |
+| `TestAdminMessageIncludesInbound` | the rendered admin message contains the inbound name |
+| `TestAdminMessageEscapesInbound` | HTML-sensitive inbound names are escaped |
 | `TestListEnabledNodes` | node list uses `GET /api/nodes?enabled=true` |
 | `TestReconnectNode` | reconnect uses `POST /api/nodes/{id}/reconnect` |
 | `TestReconnectNodeRejectsInvalidID` | invalid node IDs are rejected before a request |
@@ -93,6 +97,33 @@ is cleared when it fires.
   and `TestActiveBlockBypassesDetectionThreshold` cover the behavior;
   `TestDetectionToleranceDefaults`, `TestDetectionToleranceConfigured`, and
   `TestDetectionToleranceValidation` cover config loading.
+
+## Inbound name in admin messages (pg.10)
+
+The parser extracts the Xray inbound tag from the bracketed routing field:
+
+```text
+2026/10/31 12:00:00 from 203.0.113.9:4567 accepted tcp:tracker.example.com:443 [vless-in >> TORRENT] email: 42
+```
+
+`inboundTag` accepts optional whitespace around `>>`, rejects bracket fields
+without that separator (for example an IPv6 source literal), and requires the
+outbound side to contain `TorrentTag`. The inbound name is HTML-escaped before
+it is appended to admin Telegram block and unblock messages as:
+
+```text
+<b>Inbound :</b> vless-in
+```
+
+It is stored as `inbound` in `blocks.json`, so a later unblock message can show
+the same inbound. Failure and failsafe admin messages include it when present.
+Custom admin templates keep their existing four-argument contract; the inbound
+line is appended after rendering, so existing templates do not need editing.
+The webhook payload and the end-user message are unchanged.
+
+Tests: `TestParseLineInboundTag`, `TestInboundIsPersistedAndSentToAdmin`,
+`TestAdminMessageIncludesInbound`, and `TestAdminMessageEscapesInbound`. The
+black-box E2E also asserts that `vless-in` appears in the admin Telegram body.
 
 ## Failsafe and whitelist (pg.9)
 
@@ -156,18 +187,18 @@ this fork replaces; ignoring the email would make account resolution impossible.
 Benchmarks on the development host after the security changes:
 
 ```text
-BenchmarkParseLineDefault-4       8130405    149.3 ns/op    0 B/op   0 allocs/op
-BenchmarkParseLineCustomRegex-4   1073173   1080 ns/op     32 B/op   1 allocs/op
-BenchmarkFastEmailValue-4        21944464     54.71 ns/op    0 B/op   0 allocs/op
-BenchmarkDefaultEmailRegex-4       787584   1594 ns/op     32 B/op   1 allocs/op
+BenchmarkParseLineDefault-4       6096381    200.4 ns/op    0 B/op   0 allocs/op
+BenchmarkParseLineCustomRegex-4    982677   1191 ns/op     32 B/op   1 allocs/op
+BenchmarkFastEmailValue-4        20952476     56.59 ns/op    0 B/op   0 allocs/op
+BenchmarkDefaultEmailRegex-4       662851   1584 ns/op     32 B/op   1 allocs/op
 ```
 
-The fast path is allocation-free and about 10× faster than the regex path. A
-10-second fuzz run of `FuzzParseLine` completed 727,546 executions without a
+The fast path is allocation-free and about 6× faster than the regex path. A
+10-second fuzz run of `FuzzParseLine` completed 962,288 executions without a
 crash:
 
 ```text
-fuzz: elapsed: 11s, execs: 727546 (28026/sec), new interesting: 80 (total: 195)
+fuzz: elapsed: 10s, execs: 962288 (136314/sec), new interesting: 46 (total: 263)
 PASS
 ```
 
@@ -189,9 +220,9 @@ avg_parse=0s goroutines=4 heap_mb=1 gc=0 uptime=2s
 
 ## Black-box binary test (fake PasarGuard)
 
-`python3 qa/e2e.py` passed on `v0.3.1-pg.9` after the parser, queue,
+`python3 qa/e2e.py` passed on `v0.3.1-pg.10` after the parser, queue,
 inotify/polling, complete-line, security, non-root, sliding-expiry,
-detection-tolerance, and failsafe/whitelist changes. The E2E does not
+detection-tolerance, failsafe/whitelist, and inbound-name changes. The E2E does not
 drive the failsafe or whitelist paths itself; those are covered by the unit and
 HTTP contract tests above. It starts the real binary as the unprivileged current
 user and verifies:

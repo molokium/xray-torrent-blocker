@@ -28,6 +28,9 @@ type Detection struct {
 	Identity string
 	// IP is the source address, when it could be parsed. It is informational.
 	IP string
+	// Inbound is the Xray inbound tag from the "[inbound >> outbound]" field.
+	// It is informational and may be empty on an unrecognized log format.
+	Inbound string
 	// TelegramID is an optional chat ID found in the identity/email value.
 	// Panel-controlled username and note are checked later as fallbacks.
 	TelegramID string
@@ -63,6 +66,7 @@ func ParseLine(cfg *config.Config, line string) (Detection, error) {
 	det := Detection{
 		Identity:   identity,
 		IP:         sourceIP(line),
+		Inbound:    inboundTag(line, cfg.TorrentTag),
 		TelegramID: MatchTid(cfg.TidRE, identity),
 		Raw:        line,
 	}
@@ -116,6 +120,37 @@ func MatchTid(re *regexp.Regexp, text string) string {
 		return ""
 	}
 	return value
+}
+
+// inboundTag extracts the inbound name from Xray's routing field:
+//
+//	[vless-in >> TORRENT]
+//
+// The outbound must contain TorrentTag. Bracket fields such as an IPv6 source
+// address are skipped because they have no ">>" separator.
+func inboundTag(line, torrentTag string) string {
+	for offset := 0; offset < len(line); {
+		open := strings.IndexByte(line[offset:], '[')
+		if open < 0 {
+			return ""
+		}
+		open += offset
+		close := strings.IndexByte(line[open+1:], ']')
+		if close < 0 {
+			return ""
+		}
+		close += open + 1
+		inner := line[open+1 : close]
+		if sep := strings.Index(inner, ">>"); sep >= 0 {
+			inbound := strings.TrimSpace(inner[:sep])
+			outbound := strings.TrimSpace(inner[sep+2:])
+			if inbound != "" && strings.Contains(outbound, torrentTag) {
+				return strings.Trim(strings.TrimSpace(inbound), `"'`)
+			}
+		}
+		offset = close + 1
+	}
+	return ""
 }
 
 // sourceIP finds the Xray "from <addr>:<port>" source address. Because the

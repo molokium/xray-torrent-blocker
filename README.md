@@ -1,6 +1,6 @@
 # PasarGuard Torrent Blocker
 
-Current build: **v0.3.1-pg.9**
+Current build: **v0.3.1-pg.10**
 
 A fork of [kutovoys/xray-torrent-blocker](https://github.com/kutovoys/xray-torrent-blocker)
 based on **v0.3.1**, the last release with Telegram support, reworked to block
@@ -203,6 +203,29 @@ Failure notifications go to the **admin Telegram chat** when
 error, attempt number, and next retry. A later success sends the usual block or
 unblock message. The end user is not notified about transport failures. If admin
 Telegram is disabled, failures are only logged.
+
+### Admin inbound name
+
+Every admin block and unblock message automatically appends the Xray inbound tag
+when it was present in the access line:
+
+```text
+[inbound-tag >> TORRENT] email: 42
+```
+
+produces:
+
+```text
+<b>Inbound :</b> inbound-tag
+```
+
+The value is parsed from the bracketed routing field, not from user-controlled
+destination text or the Telegram/email field, and is HTML-escaped. It is also
+stored in `blocks.json` as `inbound` so the unblock notification can show it.
+Failure and failsafe admin messages include it too when available. Custom
+`AdminBlockTemplate`/`AdminUnblockTemplate` strings keep their existing
+arguments; the inbound line is appended after the rendered template. The webhook
+payload and user-facing message are unchanged.
 
 ## Requirements
 

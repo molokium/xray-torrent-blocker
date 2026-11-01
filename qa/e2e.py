@@ -276,6 +276,7 @@ def main() -> int:
         assert "999" in chats and "777" in chats, chats
         assert "alice" in chats["999"]["text"], chats["999"]
         assert "203.0.113.9" in chats["999"]["text"], chats["999"]
+        assert "vless-in" in chats["999"]["text"], chats["999"]
 
         wait_for(lambda: len(STATE.webhooks) == 1, "block webhook")
         assert STATE.webhooks[0]["action"] == "block", STATE.webhooks

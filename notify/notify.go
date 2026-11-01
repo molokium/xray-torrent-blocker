@@ -22,6 +22,7 @@ type Event struct {
 	Username        string
 	UserID          int
 	IP              string
+	Inbound         string
 	Hostname        string
 	DurationMinutes int
 	Timestamp       time.Time
@@ -121,6 +122,9 @@ func (d *Dispatcher) Failure(event Event, action string, cause error, attempt in
 		html.EscapeString(attemptText),
 		html.EscapeString(retryText),
 	)
+	if event.Inbound != "" {
+		text += "\nInbound: <code>" + html.EscapeString(event.Inbound) + "</code>"
+	}
 	go d.sendTelegram(d.cfg.AdminBotToken, d.cfg.AdminChatID, text, event)
 }
 
@@ -142,8 +146,13 @@ func (d *Dispatcher) Failsafe(event Event, reconnected, failed []string, cause e
 		fmt.Sprintf("<b>tblocker: failsafe reconnect %s</b>", html.EscapeString(status)),
 		fmt.Sprintf("User: <code>%s</code>", html.EscapeString(username)),
 		fmt.Sprintf("ID: %d", event.UserID),
-		fmt.Sprintf("Nodes reconnected: %s", html.EscapeString(nodeList(reconnected))),
 	}
+	if event.Inbound != "" {
+		lines = append(lines, fmt.Sprintf("Inbound: <code>%s</code>", html.EscapeString(event.Inbound)))
+	}
+	lines = append(lines,
+		fmt.Sprintf("Nodes reconnected: %s", html.EscapeString(nodeList(reconnected))),
+	)
 	if len(failed) > 0 {
 		lines = append(lines, fmt.Sprintf("Nodes failed: %s", html.EscapeString(nodeList(failed))))
 	}
@@ -181,7 +190,11 @@ func (d *Dispatcher) adminMessage(template string, event Event) string {
 	if username == "" {
 		username = fmt.Sprintf("user-%d", event.UserID)
 	}
-	return fmt.Sprintf(template, username, event.IP, event.Hostname, username)
+	text := fmt.Sprintf(template, username, event.IP, event.Hostname, username)
+	if event.Inbound != "" {
+		text += "\n<b>Inbound :</b> " + html.EscapeString(event.Inbound)
+	}
+	return text
 }
 
 func (d *Dispatcher) sendTelegram(token, chatID, text string, event Event) {

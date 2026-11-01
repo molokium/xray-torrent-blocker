@@ -34,6 +34,7 @@ type Block struct {
 	UserID              int       `json:"user_id"`
 	Username            string    `json:"username"`
 	IP                  string    `json:"ip"`
+	Inbound             string    `json:"inbound,omitempty"`
 	TelegramID          string    `json:"telegram_id,omitempty"`
 	BlockedAt           time.Time `json:"blocked_at"`
 	BlockedUntil        time.Time `json:"blocked_until"`
@@ -201,7 +202,7 @@ func (s *Store) Remove(key string) error {
 // Extend updates an active block's expiry and last-seen metadata without an
 // immediate fsync. The caller is responsible for periodic Flush calls. It
 // returns false if the key is unknown or the record is not active.
-func (s *Store) Extend(key string, until time.Time, ip, telegramID string) (Block, bool) {
+func (s *Store) Extend(key string, until time.Time, ip, inbound, telegramID string) (Block, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -217,6 +218,10 @@ func (s *Store) Extend(key string, until time.Time, ip, telegramID string) (Bloc
 	}
 	if ip != "" && ip != block.IP {
 		block.IP = ip
+		changed = true
+	}
+	if inbound != "" && inbound != block.Inbound {
+		block.Inbound = inbound
 		changed = true
 	}
 	if telegramID != "" && telegramID != block.TelegramID {

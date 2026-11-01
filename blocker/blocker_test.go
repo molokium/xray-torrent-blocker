@@ -1676,3 +1676,24 @@ func TestFailsafeFailureIsReportedAndRetryable(t *testing.T) {
 		t.Error("successful retry did not mark the block")
 	}
 }
+
+func TestInboundIsPersistedAndSentToAdmin(t *testing.T) {
+	clock := newFakeClock()
+	fp := newFakePanel(&panel.User{ID: 7, Username: "alice", Status: panel.StatusActive})
+	manager, notifier, store := newTestManager(t, testConfig(), fp, clock)
+
+	det := testDetection("7", "203.0.113.9", "")
+	det.Inbound = "vless-in"
+	if err := manager.Handle(context.Background(), det); err != nil {
+		t.Fatal(err)
+	}
+
+	block := mustBlock(t, store, "id:7")
+	if block.Inbound != "vless-in" {
+		t.Errorf("stored inbound = %q", block.Inbound)
+	}
+	events := notifier.blockEvents()
+	if len(events) != 1 || events[0].Inbound != "vless-in" {
+		t.Errorf("block events = %+v", events)
+	}
+}

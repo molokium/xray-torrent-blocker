@@ -374,3 +374,26 @@ func TestTelegramFailsafeSendsAdminOnly(t *testing.T) {
 		t.Fatal("timed out waiting for failsafe notification")
 	}
 }
+
+func TestAdminMessageIncludesInbound(t *testing.T) {
+	cfg := testConfig()
+	dispatcher := New(cfg)
+	got := dispatcher.adminMessage(cfg.AdminBlockTemplate, Event{
+		Username: "alice",
+		IP:       "203.0.113.9",
+		Inbound:  "vless-in",
+		Hostname: "node-1",
+	})
+	if !strings.Contains(got, "<b>Inbound :</b> vless-in") {
+		t.Errorf("message = %q", got)
+	}
+}
+
+func TestAdminMessageEscapesInbound(t *testing.T) {
+	cfg := testConfig()
+	dispatcher := New(cfg)
+	got := dispatcher.adminMessage(cfg.AdminBlockTemplate, Event{Username: "alice", Inbound: `vless<&`})
+	if strings.Contains(got, "vless<&") || !strings.Contains(got, "vless&lt;&amp;") {
+		t.Errorf("message = %q", got)
+	}
+}

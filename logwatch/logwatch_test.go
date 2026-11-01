@@ -508,3 +508,48 @@ func TestTelegramIDComesFromIdentityNotDestination(t *testing.T) {
 		t.Fatalf("TelegramID = %q, want 777", det.TelegramID)
 	}
 }
+
+func TestParseLineInboundTag(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want string
+	}{
+		{
+			name: "named inbound",
+			line: `2026/10/31 12:00:00 from 203.0.113.9:4567 accepted tcp:tracker.example.com:443 [vless-in >> TORRENT] email: 42`,
+			want: "vless-in",
+		},
+		{
+			name: "short inbound",
+			line: `2026/10/31 12:00:00 from 203.0.113.9:4567 accepted tcp:x:443 [in >> TORRENT] email: 42`,
+			want: "in",
+		},
+		{
+			name: "no spacing",
+			line: `2026/10/31 12:00:00 from 203.0.113.9:4567 accepted tcp:x:443 [vless-in>>TORRENT] email: 42`,
+			want: "vless-in",
+		},
+		{
+			name: "ipv6 source does not match",
+			line: `2026/10/31 12:00:00 from [2001:db8::1]:443 accepted tcp:x:1 [in >> TORRENT] email: 9`,
+			want: "in",
+		},
+		{
+			name: "no routing field",
+			line: `2026/10/31 12:00:00 from 203.0.113.9:4567 accepted [TORRENT] email: 42`,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			det, err := ParseLine(testConfig(), tc.line)
+			if err != nil {
+				t.Fatalf("ParseLine: %v", err)
+			}
+			if det.Inbound != tc.want {
+				t.Errorf("Inbound = %q, want %q", det.Inbound, tc.want)
+			}
+		})
+	}
+}

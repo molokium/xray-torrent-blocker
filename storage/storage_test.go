@@ -304,11 +304,11 @@ func TestExtendAndFlushPersists(t *testing.T) {
 	}
 
 	until := now.Add(20 * time.Minute)
-	updated, ok := store.Extend("id:7", until, "203.0.113.10", "777")
+	updated, ok := store.Extend("id:7", until, "203.0.113.10", "vless-in", "777")
 	if !ok {
 		t.Fatal("Extend returned false")
 	}
-	if !updated.BlockedUntil.Equal(until) || updated.IP != "203.0.113.10" || updated.TelegramID != "777" {
+	if !updated.BlockedUntil.Equal(until) || updated.IP != "203.0.113.10" || updated.Inbound != "vless-in" || updated.TelegramID != "777" {
 		t.Fatalf("updated = %+v", updated)
 	}
 	if err := store.Flush(); err != nil {
@@ -323,7 +323,7 @@ func TestExtendAndFlushPersists(t *testing.T) {
 	if !ok {
 		t.Fatal("record missing after reopen")
 	}
-	if !got.BlockedUntil.Equal(until) || got.IP != "203.0.113.10" || got.TelegramID != "777" {
+	if !got.BlockedUntil.Equal(until) || got.IP != "203.0.113.10" || got.Inbound != "vless-in" || got.TelegramID != "777" {
 		t.Fatalf("persisted = %+v", got)
 	}
 }
@@ -337,10 +337,10 @@ func TestExtendIgnoresPendingAndMissing(t *testing.T) {
 	if err := store.Put(Block{Key: "id:1", UserID: 1, BlockedAt: now, BlockedUntil: now.Add(time.Minute), State: StatePending}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := store.Extend("id:1", now.Add(time.Hour), "", ""); ok {
+	if _, ok := store.Extend("id:1", now.Add(time.Hour), "", "", ""); ok {
 		t.Fatal("Extend changed a pending record")
 	}
-	if _, ok := store.Extend("id:404", now.Add(time.Hour), "", ""); ok {
+	if _, ok := store.Extend("id:404", now.Add(time.Hour), "", "", ""); ok {
 		t.Fatal("Extend changed a missing record")
 	}
 }
